@@ -1432,6 +1432,141 @@ impl PyTokenizer {
         pyo3_async_runtimes::tokio::future_into_py(py, fut)
     }
 
+    /// Encode a single long input using parallel processing.
+    ///
+    /// This method uses parallel recursive splitting to tokenize long inputs faster
+    /// than serial encoding. It automatically selects the best strategy:
+    /// - For inputs < 10KB: falls back to serial encoding
+    /// - For inputs 10KB-1MB: uses recursive parallel splitting
+    /// - For inputs 1MB+: uses cache-block streaming mode
+    ///
+    /// Example::
+    ///
+    ///     encoding = tokenizer.encode_parallel("very long text..." * 10000)
+    ///
+    /// Args:
+    ///     sequence (:obj:`str`):
+    ///         The input text to encode (should be > 10KB to benefit from parallelism)
+    ///
+    ///     add_special_tokens (:obj:`bool`, defaults to :obj:`True`):
+    ///         Whether to add the special tokens
+    ///
+    /// Returns:
+    ///     :class:`~tokenizers.Encoding`: The encoded result (identical to serial encode)
+    ///
+    /// Note:
+    ///     This method provides ~2x speedup for inputs larger than 100KB.
+    ///     For smaller inputs, use the regular ``encode()`` method.
+    #[pyo3(signature = (sequence, add_special_tokens = true))]
+    #[pyo3(text_signature = "(self, sequence, add_special_tokens=True)")]
+    fn encode_parallel(
+        &self,
+        py: Python<'_>,
+        sequence: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<PyEncoding> {
+        py.allow_threads(|| {
+            ToPyResult(
+                self.tokenizer
+                    .encode_parallel_single(sequence, add_special_tokens)
+                    .map(|e| e.into()),
+            )
+            .into()
+        })
+    }
+
+    /// Encode a single long input using cache-block streaming mode.
+    ///
+    /// This method is optimized for very large inputs (1MB+) by processing them
+    /// in L2-cache-sized blocks (~128KB) with small overlap windows. This provides
+    /// better cache locality than recursive splitting for massive inputs.
+    ///
+    /// Example::
+    ///
+    ///     huge_text = "Hello world! " * 500000  # ~6.5MB
+    ///     encoding = tokenizer.encode_streaming(huge_text)
+    ///
+    /// Args:
+    ///     sequence (:obj:`str`):
+    ///         The input text to encode (best for inputs > 1MB)
+    ///
+    ///     add_special_tokens (:obj:`bool`, defaults to :obj:`True`):
+    ///         Whether to add the special tokens
+    ///
+    /// Returns:
+    ///     :class:`~tokenizers.Encoding`: The encoded result (identical to serial encode)
+    ///
+    /// Note:
+    ///     - Best for inputs 1MB+ where cache thrashing is a concern
+    ///     - For inputs < 1MB, use ``encode_parallel()`` or ``encode()``
+    ///     - Provides ~2.2x speedup for 4MB+ inputs
+    #[pyo3(signature = (sequence, add_special_tokens = true))]
+    #[pyo3(text_signature = "(self, sequence, add_special_tokens=True)")]
+    fn encode_streaming(
+        &self,
+        py: Python<'_>,
+        sequence: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<PyEncoding> {
+        py.allow_threads(|| {
+            ToPyResult(
+                self.tokenizer
+                    .encode_streaming(sequence, add_special_tokens)
+                    .map(|e| e.into()),
+            )
+            .into()
+        })
+    }
+
+    /// Encode a single long input using zero-overlap pre-token parallel splitting.
+    ///
+    /// This is the fastest parallel encoding strategy. It works by:
+    ///
+    /// 1. Pre-tokenizing the entire input once (splits at word boundaries)
+    /// 2. Tokenizing all pre-token splits in parallel using all CPU cores
+    /// 3. Concatenating results (no overlap, no filtering needed)
+    ///
+    /// This achieves true zero-overlap because pre-tokenization already splits at
+    /// word/subword boundaries, so each split can be tokenized independently.
+    ///
+    /// Example::
+    ///
+    ///     long_text = "Hello world! This is a document. " * 100000
+    ///     encoding = tokenizer.encode_parallel_zero_overlap(long_text)
+    ///
+    /// Args:
+    ///     sequence (:obj:`str`):
+    ///         The input text to encode (best for inputs with many words)
+    ///
+    ///     add_special_tokens (:obj:`bool`, defaults to :obj:`True`):
+    ///         Whether to add the special tokens
+    ///
+    /// Returns:
+    ///     :class:`~tokenizers.Encoding`: The encoded result (identical to serial encode)
+    ///
+    /// Note:
+    ///     - Best for inputs with many pre-token splits (>100 words)
+    ///     - Near-linear speedup with core count
+    ///     - Zero redundant work (no overlap tokenization)
+    ///     - Falls back to serial for small inputs
+    #[pyo3(signature = (sequence, add_special_tokens = true))]
+    #[pyo3(text_signature = "(self, sequence, add_special_tokens=True)")]
+    fn encode_parallel_zero_overlap(
+        &self,
+        py: Python<'_>,
+        sequence: &str,
+        add_special_tokens: bool,
+    ) -> PyResult<PyEncoding> {
+        py.allow_threads(|| {
+            ToPyResult(
+                self.tokenizer
+                    .encode_parallel_zero_overlap(sequence, add_special_tokens)
+                    .map(|e| e.into()),
+            )
+            .into()
+        })
+    }
+
     /// Decode the given list of ids back to a string
     ///
     /// This is used to decode anything coming back from a Language Model

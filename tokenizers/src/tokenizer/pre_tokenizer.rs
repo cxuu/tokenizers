@@ -1,6 +1,7 @@
 use crate::{
     normalizer::Range, Encoding, NormalizedString, OffsetReferential, Offsets, Result, Token,
 };
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// Various possible types of offsets
@@ -124,6 +125,76 @@ impl PreTokenizedString {
         }
 
         Ok(())
+    }
+
+    /// Tokenize all splits in parallel using rayon with chunked processing.
+    ///
+    /// This is the zero-overlap parallel tokenization strategy: since splits from
+    /// pre-tokenization are guaranteed to be independent (word boundaries), we can
+    /// tokenize them in parallel without any overlap or filtering.
+    ///
+    /// To avoid the overhead of parallelizing many tiny tasks, we group splits into
+    /// larger chunks (default: ~1000 splits per chunk) and parallelize across chunks.
+    /// Each chunk is processed sequentially within the chunk.
+    pub fn tokenize_parallel<F>(&mut self, tokenize: F) -> Result<()>
+    where
+        F: Fn(&NormalizedString) -> Result<Vec<Token>> + Sync,
+    {
+        // Collect indices of splits that need tokenization
+        let needs_tokenization: Vec<usize> = self
+            .splits
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.tokens.is_none())
+            .map(|(i, _)| i)
+            .collect();
+
+        if needs_tokenization.is_empty() {
+            return Ok(());
+        }
+
+        // For small numbers of splits, use sequential processing (parallel overhead not worth it)
+        let num_splits = needs_tokenization.len();
+        if num_splits < 1000 {
+            return self.tokenize(tokenize);
+        }
+
+        // Determine optimal chunk size based on available parallelism
+        // Goal: Create enough chunks for good parallelism, but not too many (overhead)
+        // Target: ~16-32 chunks for typical 8-16 core machines
+        let num_threads = rayon::current_num_threads();
+        let target_chunks = num_threads * 4; // 4 chunks per thread for good load balancing
+        let chunk_size = (num_splits / target_chunks).max(100).min(10000);
+
+        // Create chunks of split indices
+        let chunks: Vec<&[usize]> = needs_tokenization.chunks(chunk_size).collect();
+
+        // Process chunks in parallel, each chunk is processed sequentially
+        let chunk_results: Vec<Result<Vec<(usize, Vec<Token>)>>> = chunks
+            .par_iter()
+            .map(|chunk_indices| {
+                let mut results = Vec::with_capacity(chunk_indices.len());
+                for &idx in *chunk_indices {
+                    let tokens = tokenize(&self.splits[idx].normalized)?;
+                    results.push((idx, tokens));
+                }
+                Ok(results)
+            })
+            .collect();
+
+        // Apply results back to splits
+        for chunk_result in chunk_results {
+            for (idx, tokens) in chunk_result? {
+                self.splits[idx].tokens = Some(tokens);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the number of splits in this pre-tokenized string.
+    pub fn splits_count(&self) -> usize {
+        self.splits.len()
     }
 
     /// Transform the current `PreTokenizedString` into an `Encoding`.
