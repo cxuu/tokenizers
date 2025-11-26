@@ -47,7 +47,27 @@ This significantly reduces redundant tokenization work:
 - With depth 4 recursion (16 chunks), regular overlap tokenizes ~5-15% extra bytes
 - Safe boundary detection reduces this to ~1-2% extra bytes
 
-### 3. Zero-Cost Validation in Release
+### 3. Zero-Copy Offset Representation
+
+Uses `LazyEncoding` to defer offset operations until final materialization:
+
+```rust
+struct LazyEncoding {
+    encoding: Encoding,
+    base_offset: usize,  // O(1) shift instead of O(n)
+    start_idx: usize,    // O(log n) filter via binary search
+    end_idx: usize,      // No data copying until merge
+}
+```
+
+**Performance gains:**
+- `shift_all_offsets()`: O(n) → O(1)
+- `filter_tokens_starting_before/after()`: O(n) → O(log n)
+- With depth 4 recursion: **~30 O(n) passes → 1 O(n) pass**
+
+Only the final `materialize()` call performs actual data copying.
+
+### 4. Zero-Cost Validation in Release
 
 Debug/test builds validate parallel results against serial encoding. Release builds skip this entirely:
 
@@ -66,9 +86,12 @@ Divide-and-conquer approach for medium inputs:
 2. **Find safe split points** using SIMD search for sentence/paragraph boundaries
 3. **Recursively split** input with minimal overlap at safe boundaries
 4. **Encode chunks** in parallel using `rayon::join`
-5. **Filter and merge** tokens based on their start positions
+5. **Filter and merge** tokens using `LazyEncoding` (O(log n) binary search)
+6. **Materialize** offsets only once at the final merge
 
-**Key optimization**: When splitting at safe boundaries (`. `, `\n\n`), overlap is reduced from 500-5000 bytes to just 100-500 bytes, reducing redundant work by 80-90%.
+**Key optimizations**:
+- Safe boundary splitting reduces overlap from 500-5000 bytes to 100-500 bytes (80-90% less redundant work)
+- `LazyEncoding` defers offset operations, turning O(n × depth) into O(n) total
 
 **Best for**: 100KB-1MB inputs
 

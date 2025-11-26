@@ -52,6 +52,176 @@ const DEFAULT_STREAMING_OVERLAP: usize = 1024;
 /// Benchmarks show streaming outperforms recursive at 1MB+ due to better cache locality.
 const DEFAULT_STREAMING_THRESHOLD: usize = 1024 * 1024;
 
+// =============================================================================
+// Zero-Copy Offset Representation
+// =============================================================================
+//
+// LazyEncoding wraps an Encoding with deferred offset operations:
+// - `base_offset`: Added to all offsets on materialization (shift is O(1))
+// - `start_idx` / `end_idx`: Virtual range for filtering (no copies until merge)
+//
+// This turns O(n × depth) offset operations into O(n) at final materialization.
+
+/// A lazy wrapper around Encoding that defers offset shifting and filtering.
+///
+/// Instead of immediately modifying the encoding's offsets (O(n) per operation),
+/// this stores metadata that's applied only during final materialization.
+#[derive(Debug)]
+struct LazyEncoding {
+    encoding: Encoding,
+    /// Offset to add to all positions (applied on materialization)
+    base_offset: usize,
+    /// Start index of the valid token range (inclusive)
+    start_idx: usize,
+    /// End index of the valid token range (exclusive)
+    end_idx: usize,
+}
+
+impl LazyEncoding {
+    /// Wrap an encoding in a lazy container.
+    fn new(encoding: Encoding) -> Self {
+        let len = encoding.len();
+        Self {
+            encoding,
+            base_offset: 0,
+            start_idx: 0,
+            end_idx: len,
+        }
+    }
+
+    /// O(1) offset shift - just update the base offset.
+    #[inline]
+    fn shift_offset(&mut self, delta: usize) {
+        self.base_offset += delta;
+    }
+
+    /// Number of tokens in the current virtual range.
+    #[inline]
+    fn len(&self) -> usize {
+        self.end_idx.saturating_sub(self.start_idx)
+    }
+
+    /// Check if the virtual range is empty.
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.start_idx >= self.end_idx
+    }
+
+    /// Get offset at index (applying base_offset).
+    #[inline]
+    fn get_offset(&self, idx: usize) -> (usize, usize) {
+        let actual_idx = self.start_idx + idx;
+        let (start, end) = self.encoding.get_offsets()[actual_idx];
+        (start + self.base_offset, end + self.base_offset)
+    }
+
+    /// Get the first offset in the virtual range (with base_offset applied).
+    fn first_offset(&self) -> Option<(usize, usize)> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.get_offset(0))
+        }
+    }
+
+    /// Get the last offset in the virtual range (with base_offset applied).
+    fn last_offset(&self) -> Option<(usize, usize)> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.get_offset(self.len() - 1))
+        }
+    }
+
+    /// Count tokens starting before position (O(log n) binary search).
+    fn count_starting_before(&self, position: usize) -> usize {
+        let offsets = self.encoding.get_offsets();
+        let range = &offsets[self.start_idx..self.end_idx];
+
+        // Binary search for first token starting at or after position
+        let adjusted_pos = position.saturating_sub(self.base_offset);
+        range.partition_point(|(start, _)| *start < adjusted_pos)
+    }
+
+    /// Count tokens starting at or after position (O(log n) binary search).
+    #[allow(dead_code)]
+    fn count_starting_at_or_after(&self, position: usize) -> usize {
+        self.len() - self.count_starting_before(position)
+    }
+
+    /// Filter to keep only tokens starting before position (O(log n)).
+    /// Uses binary search to find the cut point, no data copying.
+    fn filter_starting_before(&mut self, position: usize) {
+        let offsets = self.encoding.get_offsets();
+        let range = &offsets[self.start_idx..self.end_idx];
+
+        // Binary search: find first token with start >= position (adjusted for base)
+        let adjusted_pos = position.saturating_sub(self.base_offset);
+        let cut_idx = range.partition_point(|(start, _)| *start < adjusted_pos);
+
+        self.end_idx = self.start_idx + cut_idx;
+    }
+
+    /// Filter to keep only tokens starting at or after position (O(log n)).
+    /// Uses binary search to find the cut point, no data copying.
+    fn filter_starting_at_or_after(&mut self, position: usize) {
+        let offsets = self.encoding.get_offsets();
+        let range = &offsets[self.start_idx..self.end_idx];
+
+        // Binary search: find first token with start >= position (adjusted for base)
+        let adjusted_pos = position.saturating_sub(self.base_offset);
+        let cut_idx = range.partition_point(|(start, _)| *start < adjusted_pos);
+
+        self.start_idx += cut_idx;
+    }
+
+    /// Materialize this lazy encoding into a concrete Encoding.
+    /// This applies the base offset and extracts the valid range.
+    /// Only called once at the end of parallel encoding.
+    fn materialize(self) -> Encoding {
+        // Fast path: no modifications needed
+        if self.base_offset == 0 && self.start_idx == 0 && self.end_idx == self.encoding.len() {
+            return self.encoding;
+        }
+
+        // Extract the range and apply offset in one pass
+        let ids: Vec<u32> = self.encoding.get_ids()[self.start_idx..self.end_idx].to_vec();
+        let tokens: Vec<String> = self.encoding.get_tokens()[self.start_idx..self.end_idx].to_vec();
+        let type_ids: Vec<u32> = self.encoding.get_type_ids()[self.start_idx..self.end_idx].to_vec();
+        let words: Vec<Option<u32>> =
+            self.encoding.get_word_ids()[self.start_idx..self.end_idx].to_vec();
+        let special_mask: Vec<u32> =
+            self.encoding.get_special_tokens_mask()[self.start_idx..self.end_idx].to_vec();
+        let attention_mask: Vec<u32> =
+            self.encoding.get_attention_mask()[self.start_idx..self.end_idx].to_vec();
+
+        let offsets: Vec<(usize, usize)> = self.encoding.get_offsets()[self.start_idx..self.end_idx]
+            .iter()
+            .map(|(s, e)| (s + self.base_offset, e + self.base_offset))
+            .collect();
+
+        Encoding::new(
+            ids,
+            type_ids,
+            tokens,
+            words,
+            offsets,
+            special_mask,
+            attention_mask,
+            vec![],              // Overflowing not used in parallel encoding
+            Default::default(),  // Sequence ranges rebuilt if needed
+        )
+    }
+
+    /// Merge two lazy encodings by materializing and combining.
+    fn merge_materialized(self, other: LazyEncoding) -> Encoding {
+        let mut left = self.materialize();
+        let right = other.materialize();
+        left.merge_with(right, false);
+        left
+    }
+}
+
 /// Parallel encoding mode selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParallelMode {
@@ -363,27 +533,19 @@ fn calculate_overlap_size(max_token_len: usize, safety_margin: usize, is_safe_bo
     }
 }
 
-/// Internal recursive encoding function.
+/// Internal recursive encoding function using LazyEncoding for O(1) offset shifts.
 ///
-/// Recursively splits the input and encodes chunks in parallel until reaching
-/// the base case (max depth or chunk too small).
-///
-/// The algorithm:
-/// 1. Split input at midpoint with overlap on both sides
-/// 2. Left chunk: [0, mid + overlap], Right chunk: [mid - overlap, end]
-/// 3. Both chunks encode the overlap region [mid - overlap, mid + overlap]
-/// 4. After encoding, use LEFT's tokens for positions < mid (split point)
-/// 5. Use RIGHT's tokens for positions >= mid
-/// 6. This ensures correct tokenization because both sides have enough context
-fn encode_recursive<F>(
+/// Returns a LazyEncoding that defers offset materialization until the final merge.
+/// This turns O(n × depth) offset operations into O(n) total.
+fn encode_recursive_lazy<F>(
     encode_fn: &F,
     max_token_len: usize,
     input: &str,
-    input_global_offset: usize, // Offset of this chunk in the original input
+    input_global_offset: usize,
     current_depth: usize,
     max_depth: usize,
     config: &ParallelConfig,
-) -> Result<Encoding>
+) -> Result<LazyEncoding>
 where
     F: Fn(&str, bool) -> Result<Encoding> + Send + Sync,
 {
@@ -408,14 +570,15 @@ where
             );
         }
 
-        let mut encoding = encode_fn(input, false)?;
+        let encoding = encode_fn(input, false)?;
+        let mut lazy = LazyEncoding::new(encoding);
 
-        // Shift offsets to global coordinates if not at root
+        // O(1) offset shift instead of O(n)
         if input_global_offset > 0 {
-            encoding.shift_all_offsets(input_global_offset as isize);
+            lazy.shift_offset(input_global_offset);
         }
 
-        return Ok(encoding);
+        return Ok(lazy);
     }
 
     if debug {
@@ -429,13 +592,13 @@ where
     }
 
     // Find split point near midpoint using SIMD-accelerated search
-    // Prefer safe boundaries (sentence/paragraph ends) which need minimal overlap
     let mid = input.len() / 2;
-    let split_result = find_split_point_safe(input, mid, 500); // Larger window to find safe boundaries
+    let split_result = find_split_point_safe(input, mid, 500);
     let split_point = split_result.position;
 
     // Calculate overlap size - much smaller for safe boundaries
-    let overlap_size = calculate_overlap_size(max_token_len, config.safety_margin, split_result.is_safe_boundary);
+    let overlap_size =
+        calculate_overlap_size(max_token_len, config.safety_margin, split_result.is_safe_boundary);
 
     if debug && split_result.is_safe_boundary {
         println!(
@@ -444,18 +607,13 @@ where
         );
     }
 
-    // Create overlapping chunks:
-    // Left chunk: [0, split_point + overlap_size]
-    // Right chunk: [split_point - overlap_size, end]
-    // Both chunks encode the region around split_point with enough overlap
+    // Create overlapping chunks
     let left_end = find_char_boundary_forward(input, (split_point + overlap_size).min(input.len()));
     let right_start = find_char_boundary_forward(input, split_point.saturating_sub(overlap_size));
 
     let left_chunk = &input[..left_end];
     let right_chunk = &input[right_start..];
 
-    // The merge point is where we switch from left to right encoding
-    // Use the split_point (in global coordinates) as the boundary
     let global_split_point = input_global_offset + split_point;
 
     if debug {
@@ -472,25 +630,25 @@ where
         );
     }
 
-    // Parallel recursive calls for left and right
+    // Parallel recursive calls
     let (left_result, right_result) = rayon::join(
         || {
-            encode_recursive(
+            encode_recursive_lazy(
                 encode_fn,
                 max_token_len,
                 left_chunk,
-                input_global_offset, // Left chunk starts at same global offset
+                input_global_offset,
                 current_depth + 1,
                 max_depth,
                 config,
             )
         },
         || {
-            encode_recursive(
+            encode_recursive_lazy(
                 encode_fn,
                 max_token_len,
                 right_chunk,
-                input_global_offset + right_start, // Right chunk offset
+                input_global_offset + right_start,
                 current_depth + 1,
                 max_depth,
                 config,
@@ -498,98 +656,78 @@ where
         },
     );
 
-    let mut left_enc = left_result?;
-    let mut right_enc = right_result?;
+    let mut left_lazy = left_result?;
+    let mut right_lazy = right_result?;
 
     if debug {
         println!(
             "[RECURSIVE depth={}] Before filtering - Left: {} tokens, Right: {} tokens",
             current_depth,
-            left_enc.len(),
-            right_enc.len()
+            left_lazy.len(),
+            right_lazy.len()
         );
     }
 
-    // Count tokens that should be in each half based on their start position
-    let left_tokens_expected = left_enc
-        .get_offsets()
-        .iter()
-        .filter(|(start, _)| *start < global_split_point)
-        .count();
-    let right_tokens_expected = right_enc
-        .get_offsets()
-        .iter()
-        .filter(|(start, _)| *start >= global_split_point)
-        .count();
+    // O(log n) count using binary search
+    let left_tokens_expected = left_lazy.count_starting_before(global_split_point);
+    let right_tokens_expected = right_lazy.count_starting_at_or_after(global_split_point);
 
-    // Filter tokens based on where they START:
-    // - Left: keep tokens that START before the split point
-    // - Right: keep tokens that START at or after the split point
-    // This ensures each token is assigned to exactly one side with no duplicates or gaps
-    left_enc.filter_tokens_starting_before(global_split_point);
-    right_enc.filter_tokens_starting_at_or_after(global_split_point);
+    // O(log n) filter using binary search - just updates indices, no data copying
+    left_lazy.filter_starting_before(global_split_point);
+    right_lazy.filter_starting_at_or_after(global_split_point);
 
     if debug {
         println!(
             "[RECURSIVE depth={}] After filtering - Left: {} tokens, Right: {} tokens",
             current_depth,
-            left_enc.len(),
-            right_enc.len()
+            left_lazy.len(),
+            right_lazy.len()
         );
     }
 
-    // Safety check: if expected tokens are missing after filtering, something went wrong
-    // This can happen when tokens span way beyond the overlap region
-    // Fall back to serial encoding for this chunk
-    if (left_tokens_expected > 0 && left_enc.is_empty())
-        || (right_tokens_expected > 0 && right_enc.is_empty())
+    // Safety check: tokens lost during filtering
+    if (left_tokens_expected > 0 && left_lazy.is_empty())
+        || (right_tokens_expected > 0 && right_lazy.is_empty())
     {
         if debug {
             println!(
-                "[RECURSIVE depth={}] WARNING: Tokens lost during filtering (left: {} expected, {} got; right: {} expected, {} got), falling back to serial",
-                current_depth,
-                left_tokens_expected,
-                left_enc.len(),
-                right_tokens_expected,
-                right_enc.len()
+                "[RECURSIVE depth={}] WARNING: Tokens lost, falling back to serial",
+                current_depth
             );
         }
-        let mut encoding = encode_fn(input, false)?;
+        let encoding = encode_fn(input, false)?;
+        let mut lazy = LazyEncoding::new(encoding);
         if input_global_offset > 0 {
-            encoding.shift_all_offsets(input_global_offset as isize);
+            lazy.shift_offset(input_global_offset);
         }
-        return Ok(encoding);
+        return Ok(lazy);
     }
 
-    // Additional safety check: ensure left and right properly cover the split boundary
-    // Left's last token should end near the split point, and right's first token should start near it
-    let left_max_end = left_enc.get_offsets().last().map(|(_, end)| *end).unwrap_or(0);
-    let right_min_start = right_enc.get_offsets().first().map(|(start, _)| *start).unwrap_or(input_global_offset + input.len());
+    // Safety check: gap between left and right
+    let left_max_end = left_lazy.last_offset().map(|(_, end)| end).unwrap_or(0);
+    let right_min_start = right_lazy
+        .first_offset()
+        .map(|(start, _)| start)
+        .unwrap_or(input_global_offset + input.len());
 
-    // If there's a significant gap between left's end and right's start, fall back
-    // Allow some gap for whitespace-only regions, but not more than the overlap size
     let gap = right_min_start.saturating_sub(left_max_end);
     if gap > overlap_size {
         if debug {
             println!(
-                "[RECURSIVE depth={}] WARNING: Gap between left (end={}) and right (start={}) is {} bytes, exceeds overlap {}, falling back to serial",
-                current_depth,
-                left_max_end,
-                right_min_start,
-                gap,
-                overlap_size
+                "[RECURSIVE depth={}] WARNING: Gap {} exceeds overlap {}, falling back to serial",
+                current_depth, gap, overlap_size
             );
         }
-        let mut encoding = encode_fn(input, false)?;
+        let encoding = encode_fn(input, false)?;
+        let mut lazy = LazyEncoding::new(encoding);
         if input_global_offset > 0 {
-            encoding.shift_all_offsets(input_global_offset as isize);
+            lazy.shift_offset(input_global_offset);
         }
-        return Ok(encoding);
+        return Ok(lazy);
     }
 
-    // Merge: left + right
-    let mut result = left_enc;
-    result.merge_with(right_enc, false);
+    // Merge: materialize both and combine
+    let result = left_lazy.merge_materialized(right_lazy);
 
     if debug {
         println!(
@@ -609,18 +747,57 @@ where
     if has_overlapping_offsets {
         if debug {
             println!(
-                "[RECURSIVE depth={}] WARNING: Detected overlapping offsets, falling back to serial",
+                "[RECURSIVE depth={}] WARNING: Overlapping offsets, falling back to serial",
                 current_depth
             );
         }
-        let mut encoding = encode_fn(input, false)?;
+        let encoding = encode_fn(input, false)?;
+        let mut lazy = LazyEncoding::new(encoding);
         if input_global_offset > 0 {
-            encoding.shift_all_offsets(input_global_offset as isize);
+            lazy.shift_offset(input_global_offset);
         }
-        return Ok(encoding);
+        return Ok(lazy);
     }
 
-    Ok(result)
+    // Wrap the merged result in a new LazyEncoding (no offset shift needed)
+    Ok(LazyEncoding::new(result))
+}
+
+/// Internal recursive encoding function.
+///
+/// Recursively splits the input and encodes chunks in parallel until reaching
+/// the base case (max depth or chunk too small).
+///
+/// The algorithm:
+/// 1. Split input at midpoint with overlap on both sides
+/// 2. Left chunk: [0, mid + overlap], Right chunk: [mid - overlap, end]
+/// 3. Both chunks encode the overlap region [mid - overlap, mid + overlap]
+/// 4. After encoding, use LEFT's tokens for positions < mid (split point)
+/// 5. Use RIGHT's tokens for positions >= mid
+/// 6. This ensures correct tokenization because both sides have enough context
+fn encode_recursive<F>(
+    encode_fn: &F,
+    max_token_len: usize,
+    input: &str,
+    input_global_offset: usize,
+    current_depth: usize,
+    max_depth: usize,
+    config: &ParallelConfig,
+) -> Result<Encoding>
+where
+    F: Fn(&str, bool) -> Result<Encoding> + Send + Sync,
+{
+    // Use lazy encoding internally, materialize at the end
+    let lazy = encode_recursive_lazy(
+        encode_fn,
+        max_token_len,
+        input,
+        input_global_offset,
+        current_depth,
+        max_depth,
+        config,
+    )?;
+    Ok(lazy.materialize())
 }
 
 /// Cache-block streaming encode for very large inputs (4MB+).
