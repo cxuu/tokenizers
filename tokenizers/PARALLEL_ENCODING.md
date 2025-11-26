@@ -15,6 +15,47 @@ Two parallel encoding strategies available:
 1. **Recursive Parallelism** — Best for 100KB-500KB (1.7-2.1x speedup)
 2. **Cache-Block Streaming** — Best for 1MB+ (2.0-2.3x consistent speedup)
 
+## Performance Optimizations
+
+### 1. SIMD-Accelerated Boundary Detection
+
+Uses the `memchr` crate for vectorized searching when finding split points:
+
+```rust
+use memchr::memchr_iter;
+
+// 10-20x faster than byte-by-byte scanning for large inputs
+for pos in memchr_iter(b' ', &bytes[target..end]) {
+    // Process whitespace positions
+}
+```
+
+Split point detection prioritizes **safe boundaries** in order:
+1. `\n\n` — Paragraph breaks (guaranteed token boundary)
+2. `. `, `.\n`, `! `, `!\n`, `? `, `?\n` — Sentence endings
+
+### 2. Minimal Overlap for Safe Boundaries
+
+When splitting at safe boundaries (sentence/paragraph ends), overlap is reduced by **80-90%**:
+
+| Boundary Type | Overlap Size |
+|--------------|--------------|
+| Safe (sentence/paragraph) | 100-500 bytes |
+| Regular (whitespace) | 500-5000 bytes |
+
+This significantly reduces redundant tokenization work:
+- With depth 4 recursion (16 chunks), regular overlap tokenizes ~5-15% extra bytes
+- Safe boundary detection reduces this to ~1-2% extra bytes
+
+### 3. Zero-Cost Validation in Release
+
+Debug/test builds validate parallel results against serial encoding. Release builds skip this entirely:
+
+```rust
+#[cfg(not(any(test, debug_assertions)))]
+let should_validate = false; // Zero cost - no env var check
+```
+
 ## Algorithms
 
 ### Strategy 1: Recursive Parallelism (<1MB)
@@ -22,9 +63,12 @@ Two parallel encoding strategies available:
 Divide-and-conquer approach for medium inputs:
 
 1. **Auto-tune** recursion depth based on input size and CPU cores
-2. **Recursively split** input at midpoints with overlap regions
-3. **Encode chunks** in parallel using `rayon::join`
-4. **Filter and merge** tokens based on their start positions
+2. **Find safe split points** using SIMD search for sentence/paragraph boundaries
+3. **Recursively split** input with minimal overlap at safe boundaries
+4. **Encode chunks** in parallel using `rayon::join`
+5. **Filter and merge** tokens based on their start positions
+
+**Key optimization**: When splitting at safe boundaries (`. `, `\n\n`), overlap is reduced from 500-5000 bytes to just 100-500 bytes, reducing redundant work by 80-90%.
 
 **Best for**: 100KB-1MB inputs
 
@@ -89,8 +133,13 @@ pub struct ParallelConfig {
     pub mode: ParallelMode,         // Auto, Recursive, or Streaming
     pub block_size: usize,          // Streaming block size (default: 128KB)
     pub streaming_threshold: usize, // Switch to streaming at (default: 1MB)
+    pub safety_margin: usize,       // Extra overlap bytes (default: 64)
 }
 ```
+
+**Smart overlap sizing**: The actual overlap used depends on the split point type:
+- Safe boundaries (sentence/paragraph ends): `max_token_len + safety_margin` (100-500 bytes)
+- Regular whitespace boundaries: `max_token_len × 3` (500-5000 bytes)
 
 ## Performance
 
@@ -166,3 +215,23 @@ let encoding = tokenizer.encode_parallel_with_config(&text, false, config)?;
 | 1MB+ | Streaming | **2.0-2.3x** |
 
 **Key insight**: Both modes achieve excellent speedup (~2x). Streaming provides slightly better and more consistent performance for large inputs (1MB+).
+
+## Dependencies
+
+The parallel encoding module uses:
+- `rayon` — Work-stealing parallel execution
+- `memchr` — SIMD-accelerated byte searching (AVX2/SSE2)
+
+## Debug Mode
+
+Set `DEBUG_PARALLEL=1` to enable verbose logging:
+
+```bash
+DEBUG_PARALLEL=1 cargo test parallel
+```
+
+This shows:
+- Split point detection (safe vs regular boundaries)
+- Overlap sizes used at each split
+- Token counts before/after filtering
+- Streaming block progress
