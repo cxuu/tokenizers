@@ -1,8 +1,8 @@
 use super::{super::OrderedVocabIter, trainer::BpeTrainer, Error, Pair, Word};
-use crate::tokenizer::{Model, Result, Token};
+use crate::tokenizer::{Cut, Model, Result, Token};
 use crate::utils::cache::{Cache, DEFAULT_CACHE_CAPACITY, MAX_LENGTH};
 use crate::utils::iter::ResultShunt;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use serde_json::Value;
 use std::borrow::Cow;
 
@@ -205,7 +205,19 @@ impl BpeBuilder {
             fuse_unk: self.config.fuse_unk,
             byte_fallback: self.config.byte_fallback,
             ignore_merges: self.config.ignore_merges,
+            merges_across: MergesAcross::default(),
         })
+    }
+}
+
+/// Results of `BPE::never_merges_across` per separator. They only depend on the vocabulary and
+/// merges, so they must be cleared when these change.
+#[derive(Default)]
+pub(crate) struct MergesAcross(std::sync::RwLock<Vec<(char, bool)>>);
+
+impl PartialEq for MergesAcross {
+    fn eq(&self, _other: &Self) -> bool {
+        true
     }
 }
 
@@ -236,6 +248,7 @@ pub struct BPE {
     pub byte_fallback: bool,
     /// Whether or not to direct output words if they are part of the vocab.
     pub ignore_merges: bool,
+    pub(crate) merges_across: MergesAcross,
 }
 
 impl std::fmt::Debug for BPE {
@@ -277,6 +290,7 @@ impl Clone for BPE {
             fuse_unk: self.fuse_unk,
             byte_fallback: self.byte_fallback,
             ignore_merges: self.ignore_merges,
+            merges_across: MergesAcross::default(),
         }
     }
 }
@@ -466,6 +480,68 @@ impl BPE {
         Ok(word)
     }
 
+    /// Whether no merge can join a symbol ending with an ASCII letter to a symbol starting with
+    /// `sep`. Merges then happen independently on each side, and since they are ordered by rank
+    /// then position, each side is merged the same way as if it were alone.
+    fn never_merges_across(&self, sep: char) -> bool {
+        let cached = self.merges_across.0.read().ok().and_then(|cache| {
+            cache
+                .iter()
+                .find(|(s, _)| *s == sep)
+                .map(|(_, result)| *result)
+        });
+        if let Some(result) = cached {
+            return result;
+        }
+        let result = self.compute_never_merges_across(sep);
+        if let Ok(mut cache) = self.merges_across.0.write() {
+            cache.push((sep, result));
+        }
+        result
+    }
+
+    fn compute_never_merges_across(&self, sep: char) -> bool {
+        let id = |c: char| self.vocab.get(c.encode_utf8(&mut [0; 4]) as &str).copied();
+        // With every char in the vocabulary, the initial symbols are these ids: no unknown
+        // or byte fallback symbols around the cut.
+        let Some(sep) = id(sep) else {
+            return false;
+        };
+        let Some(letters) = ('a'..='z')
+            .chain('A'..='Z')
+            .map(id)
+            .collect::<Option<Vec<u32>>>()
+        else {
+            return false;
+        };
+        let mut by_left: AHashMap<u32, Vec<u32>> = AHashMap::new();
+        let mut by_right: AHashMap<u32, Vec<u32>> = AHashMap::new();
+        for (&(a, b), &(_, merged)) in &self.merges {
+            by_left.entry(a).or_default().push(merged);
+            by_right.entry(b).or_default().push(merged);
+        }
+        let closure = |start: Vec<u32>, merged_from: &AHashMap<u32, Vec<u32>>| {
+            let mut seen: AHashSet<u32> = start.iter().copied().collect();
+            let mut todo = start;
+            while let Some(id) = todo.pop() {
+                for &merged in merged_from.get(&id).into_iter().flatten() {
+                    if seen.insert(merged) {
+                        todo.push(merged);
+                    }
+                }
+            }
+            seen
+        };
+        // Symbols that can end right before the cut: merging something to the left of one
+        // keeps its end. Symbols that can start at the cut: merging to their right keeps it.
+        let left = closure(letters, &by_right);
+        let right = closure(vec![sep], &by_left);
+        !self
+            .merges
+            .keys()
+            .any(|(a, b)| left.contains(a) && right.contains(b))
+    }
+
     fn word_to_tokens<'a>(&'a self, word: &'a Word) -> impl Iterator<Item = Token> + 'a {
         word.get_chars_iter()
             .zip(word.get_offsets_iter())
@@ -505,6 +581,23 @@ impl Model for BPE {
 
     fn get_vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    fn supports_cut(&self, cut: Cut) -> bool {
+        let deterministic = self.dropout.is_none_or(|d| d == 0.0);
+        match cut {
+            Cut::Boundary => deterministic,
+            Cut::Inside { sep } => {
+                deterministic
+                    && self.continuing_subword_prefix.is_none()
+                    && self.end_of_word_suffix.is_none()
+                    // Looking up the whole word in the vocabulary first doesn't decompose.
+                    && !self.ignore_merges
+                    // Without it, unknown chars are dropped and later offsets in the word lag.
+                    && self.unk_token.is_some()
+                    && self.never_merges_across(sep)
+            }
+        }
     }
 
     fn tokenize(&self, sequence: &str) -> Result<Vec<Token>> {

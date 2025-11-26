@@ -134,4 +134,9 @@ impl Normalizer for BertNormalizer {
 
         Ok(())
     }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        // Each step maps a space, and ASCII letters, to themselves, one char at a time.
+        (sep == ' ').then_some(' ')
+    }
 }

@@ -83,6 +83,39 @@ impl Normalizer for Replace {
     fn normalize(&self, normalized: &mut NormalizedString) -> Result<()> {
         normalized.replace(&self.regex, &self.content)
     }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        let single = |s: &str| {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(c), None) => Some(c),
+                _ => None,
+            }
+        };
+        let pattern = match &self.pattern {
+            ReplacePattern::String(pattern) => pattern,
+            // Runs of 2+ spaces never include a separator between two letters.
+            ReplacePattern::Regex(regex) if regex == " {2,}" => return Some(sep),
+            // A space between two letters is a whitespace run on its own.
+            ReplacePattern::Regex(regex) if regex == "\\s+" => {
+                return match sep {
+                    ' ' => single(&self.content).filter(|c| !c.is_ascii_alphabetic()),
+                    '▁' => Some(sep),
+                    _ => None,
+                };
+            }
+            ReplacePattern::Regex(_) => return None,
+        };
+        if single(pattern) == Some(sep) {
+            // Each separator is replaced on its own, by a single char.
+            return single(&self.content).filter(|c| !c.is_ascii_alphabetic());
+        }
+        // Text around the cut is a letter, the separator and a letter: a pattern with none
+        // of these can't match there.
+        let reaches_cut =
+            pattern.is_empty() || pattern.chars().any(|c| c == sep || c.is_ascii_alphabetic());
+        (!reaches_cut).then_some(sep)
+    }
 }
 
 impl Decoder for Replace {

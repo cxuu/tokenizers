@@ -21,6 +21,14 @@ impl Normalizer for Prepend {
         }
         Ok(())
     }
+
+    fn normalize_continuation(&self, _normalized: &mut NormalizedString) -> Result<()> {
+        Ok(())
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        Some(sep)
+    }
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::tokenizer::{
-    pattern::Invert, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
+    pattern::Invert, Cut, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
 };
 use crate::utils::macro_rules_attribute;
 
@@ -26,6 +26,14 @@ impl PreTokenizer for Whitespace {
             normalized.split(Invert(re_ref), SplitDelimiterBehavior::Removed)
         })
     }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        // A space between two letters ends a `\w+` match and is removed.
+        match cut {
+            Cut::Inside { sep: ' ' } | Cut::Boundary => Some(Cut::Boundary),
+            Cut::Inside { .. } => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -36,6 +44,13 @@ impl PreTokenizer for WhitespaceSplit {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.split(|_, normalized| {
             normalized.split(char::is_whitespace, SplitDelimiterBehavior::Removed)
+        })
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        Some(match cut {
+            Cut::Inside { sep } if sep.is_whitespace() => Cut::Boundary,
+            cut => cut,
         })
     }
 }

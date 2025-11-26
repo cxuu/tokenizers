@@ -1,5 +1,5 @@
 use crate::normalizer::Range;
-use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result};
+use crate::tokenizer::{Cut, PreTokenizedString, PreTokenizer, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::macro_rules_attribute;
@@ -46,6 +46,11 @@ impl PreTokenizer for FixedLength {
 
             Ok(splits)
         })
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        // Chunks are counted from the start of each split.
+        (cut == Cut::Boundary).then_some(Cut::Boundary)
     }
 }
 

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
+use crate::tokenizer::{Cut, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
 use crate::utils::macro_rules_attribute;
 use unicode_categories::UnicodeCategories;
 
@@ -34,6 +34,16 @@ impl Default for Punctuation {
 impl PreTokenizer for Punctuation {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.split(|_, s| s.split(is_punc, self.behavior))
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        // Letters aren't punctuation, so only a punctuation separator is matched near the cut.
+        match cut {
+            Cut::Inside { sep } if is_punc(sep) => (self.behavior
+                != SplitDelimiterBehavior::MergedWithPrevious)
+                .then_some(Cut::Boundary),
+            cut => Some(cut),
+        }
     }
 }
 

@@ -59,6 +59,23 @@ impl PreTokenizer for PreTokenizerWrapper {
             Self::FixedLength(fl) => fl.pre_tokenize(normalized),
         }
     }
+
+    fn map_cut(&self, cut: crate::Cut) -> Option<crate::Cut> {
+        match self {
+            Self::BertPreTokenizer(bpt) => bpt.map_cut(cut),
+            Self::ByteLevel(bpt) => bpt.map_cut(cut),
+            Self::Delimiter(dpt) => dpt.map_cut(cut),
+            Self::Metaspace(mspt) => mspt.map_cut(cut),
+            Self::Whitespace(wspt) => wspt.map_cut(cut),
+            Self::Punctuation(tok) => tok.map_cut(cut),
+            Self::Sequence(tok) => tok.map_cut(cut),
+            Self::Split(tok) => tok.map_cut(cut),
+            Self::WhitespaceSplit(wspt) => wspt.map_cut(cut),
+            Self::Digits(wspt) => wspt.map_cut(cut),
+            Self::UnicodeScripts(us) => us.map_cut(cut),
+            Self::FixedLength(fl) => fl.map_cut(cut),
+        }
+    }
 }
 
 impl<'de> Deserialize<'de> for PreTokenizerWrapper {

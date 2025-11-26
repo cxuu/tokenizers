@@ -86,6 +86,10 @@ impl Model for PyModel {
     fn get_trainer(&self) -> Self::Trainer {
         self.model.read().unwrap().get_trainer().into()
     }
+
+    fn supports_cut(&self, cut: tk::Cut) -> bool {
+        self.model.read().unwrap().supports_cut(cut)
+    }
 }
 
 impl<I> From<I> for PyModel

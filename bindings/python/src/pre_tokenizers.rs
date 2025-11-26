@@ -20,7 +20,7 @@ use tk::pre_tokenizers::unicode_scripts::UnicodeScripts;
 use tk::pre_tokenizers::whitespace::{Whitespace, WhitespaceSplit};
 use tk::pre_tokenizers::PreTokenizerWrapper;
 use tk::tokenizer::Offsets;
-use tk::{PreTokenizedString, PreTokenizer};
+use tk::{Cut, PreTokenizedString, PreTokenizer};
 use tokenizers as tk;
 
 use super::error::ToPyResult;
@@ -135,6 +135,10 @@ impl PyPreTokenizer {
 impl PreTokenizer for PyPreTokenizer {
     fn pre_tokenize(&self, normalized: &mut PreTokenizedString) -> tk::Result<()> {
         self.pretok.pre_tokenize(normalized)
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        self.pretok.map_cut(cut)
     }
 }
 
@@ -961,6 +965,15 @@ impl PreTokenizer for PyPreTokenizerTypeWrapper {
             }),
         }
     }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        match self {
+            PyPreTokenizerTypeWrapper::Single(inner) => inner.read().ok()?.map_cut(cut),
+            PyPreTokenizerTypeWrapper::Sequence(inner) => inner
+                .iter()
+                .try_fold(cut, |cut, n| n.read().ok()?.map_cut(cut)),
+        }
+    }
 }
 
 impl PreTokenizer for PyPreTokenizerWrapper {
@@ -968,6 +981,13 @@ impl PreTokenizer for PyPreTokenizerWrapper {
         match self {
             PyPreTokenizerWrapper::Wrapped(inner) => inner.pre_tokenize(pretok),
             PyPreTokenizerWrapper::Custom(inner) => inner.pre_tokenize(pretok),
+        }
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        match self {
+            PyPreTokenizerWrapper::Wrapped(inner) => inner.map_cut(cut),
+            PyPreTokenizerWrapper::Custom(_) => None,
         }
     }
 }

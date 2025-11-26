@@ -38,6 +38,18 @@ impl Normalizer for Strip {
 
         Ok(())
     }
+
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> Result<()> {
+        if self.strip_right {
+            normalized.rstrip();
+        }
+        Ok(())
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        // The left side ends with a letter, so `strip_right` leaves it alone.
+        Some(sep)
+    }
 }
 
 // This normalizer removes combining marks from a normalized string
@@ -52,6 +64,10 @@ impl Normalizer for StripAccents {
     fn normalize(&self, normalized: &mut NormalizedString) -> Result<()> {
         normalized.filter(|c| !is_combining_mark(c));
         Ok(())
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        (!is_combining_mark(sep)).then_some(sep)
     }
 }
 

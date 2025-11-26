@@ -1,5 +1,5 @@
 use crate::pre_tokenizers::PreTokenizerWrapper;
-use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result};
+use crate::tokenizer::{Cut, PreTokenizedString, PreTokenizer, Result};
 use crate::utils::macro_rules_attribute;
 use serde::{Deserialize, Serialize};
 
@@ -42,6 +42,12 @@ impl PreTokenizer for Sequence {
             pretokenizer.pre_tokenize(pretokenized)?;
         }
         Ok(())
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        self.pretokenizers
+            .iter()
+            .try_fold(cut, |cut, pretokenizer| pretokenizer.map_cut(cut))
     }
 }
 

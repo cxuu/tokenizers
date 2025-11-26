@@ -1,5 +1,5 @@
 use super::OrderedVocabIter;
-use crate::tokenizer::{Model, Result, Token};
+use crate::tokenizer::{Cut, Model, Result, Token};
 use ahash::AHashMap;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -158,6 +158,10 @@ impl Default for WordLevel {
 
 impl Model for WordLevel {
     type Trainer = WordLevelTrainer;
+
+    fn supports_cut(&self, cut: Cut) -> bool {
+        cut == Cut::Boundary
+    }
 
     fn tokenize(&self, token: &str) -> Result<Vec<Token>> {
         if let Some(&id) = self.vocab.get(token) {

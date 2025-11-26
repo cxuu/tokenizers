@@ -3,7 +3,7 @@ use super::{
     trainer::UnigramTrainer,
     trie::{Trie, TrieBuilder},
 };
-use crate::tokenizer::{Model, Result, Token};
+use crate::tokenizer::{Cut, Model, Result, Token};
 use crate::utils::cache::{Cache, MAX_LENGTH};
 use std::collections::HashMap;
 
@@ -414,6 +414,10 @@ impl Model for Unigram {
 
     fn get_vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    fn supports_cut(&self, cut: Cut) -> bool {
+        cut == Cut::Boundary
     }
 
     fn tokenize(&self, sentence: &str) -> Result<Vec<Token>> {

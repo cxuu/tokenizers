@@ -1054,6 +1054,27 @@ class Tokenizer:
         """
         pass
 
+    def encode_parallel(self, sequence, add_special_tokens=True):
+        """
+        Encode a single sequence using multiple threads
+
+        The result is identical to :meth:`~tokenizers.Tokenizer.encode` with the same
+        arguments. Long inputs are cut into segments encoded in parallel when the normalizer,
+        pre-tokenizer, model and added tokens of this tokenizer allow it; otherwise only the
+        model runs in parallel. Short inputs are encoded serially.
+
+        Args:
+            sequence (:obj:`str`):
+                The raw text sequence to encode
+
+            add_special_tokens (:obj:`bool`, defaults to :obj:`True`):
+                Whether to add the special tokens
+
+        Returns:
+            :class:`~tokenizers.Encoding`: The encoded result
+        """
+        pass
+
     @property
     def encode_special_tokens(self):
         """

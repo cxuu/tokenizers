@@ -15,7 +15,6 @@ use std::{
     io::{prelude::*, BufReader},
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
-    sync::OnceLock,
 };
 
 use serde::de::DeserializeOwned;
@@ -48,6 +47,7 @@ pub use crate::utils::truncation::{
 pub use added_vocabulary::*;
 pub use encoding::*;
 pub use normalizer::{NormalizedString, OffsetReferential, SplitDelimiterBehavior};
+pub use parallel_encode::{Cut, ParallelConfig, ParallelPlan};
 pub use pre_tokenizer::*;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -57,6 +57,22 @@ pub type Offsets = (usize, usize);
 /// Takes care of pre-processing strings.
 pub trait Normalizer {
     fn normalize(&self, normalized: &mut NormalizedString) -> Result<()>;
+
+    /// Normalize text that directly follows text normalized separately, like the right side of
+    /// a parallel encoding cut: same as `normalize`, minus what only applies at the start of a
+    /// string.
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> Result<()> {
+        self.normalize(normalized)
+    }
+
+    /// Used by parallel encoding (see [`parallel_encode`]). For any `a` ending with an ASCII
+    /// letter and `b` made of `sep` then an ASCII letter then anything, normalizing `a + b`
+    /// must give `normalize(a) + normalize_continuation(b)`, alignments included, with the
+    /// ASCII letters still ASCII letters and `sep` replaced by exactly the returned character.
+    /// Returns `None` when that can't be guaranteed.
+    fn map_cut_separator(&self, _sep: char) -> Option<char> {
+        None
+    }
 }
 
 /// The `PreTokenizer` is in charge of doing the pre-segmentation step. It splits the given string
@@ -66,6 +82,15 @@ pub trait Normalizer {
 /// the original string.
 pub trait PreTokenizer {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()>;
+
+    /// Used by parallel encoding (see [`parallel_encode`]). Consider the splits of `a + b`,
+    /// equal to the splits of `a` followed by the splits of `b`, except that with
+    /// [`Cut::Inside`] the last split of `a` and the first split of `b` form a single split.
+    /// After `pre_tokenize`, the same must hold, with the returned [`Cut`]. Returns `None`
+    /// when that can't be guaranteed.
+    fn map_cut(&self, _cut: Cut) -> Option<Cut> {
+        None
+    }
 }
 
 /// Represents a model used during Tokenization (like BPE or Word or Unigram).
@@ -82,20 +107,19 @@ pub trait Model {
     fn get_vocab(&self) -> HashMap<String, u32>;
     /// Retrieve the size of the vocabulary
     fn get_vocab_size(&self) -> usize;
-    /// Get the maximum token length in bytes across the entire vocabulary.
-    /// Used for determining safe overlap sizes in parallel tokenization.
-    fn max_token_byte_length(&self) -> usize {
-        self.get_vocab()
-            .keys()
-            .map(|s| s.len())
-            .max()
-            .unwrap_or(0)
-    }
     /// Save the current `Model` in the given folder, using the given `prefix` for the various
     /// files that need to be saved.
     fn save(&self, folder: &Path, prefix: Option<&str>) -> Result<Vec<PathBuf>>;
     /// Get an instance of a Trainer capable of training this Model
     fn get_trainer(&self) -> <Self as Model>::Trainer;
+    /// Used by parallel encoding (see [`parallel_encode`]). With [`Cut::Boundary`], whether
+    /// `tokenize` is a deterministic function of its input. With [`Cut::Inside`], whether in
+    /// addition, for any `a` ending with an ASCII letter and `b` made of `sep` then an ASCII
+    /// letter then anything, tokenizing `a + b` gives the tokens of `a` followed by the
+    /// tokens of `b`.
+    fn supports_cut(&self, _cut: Cut) -> bool {
+        false
+    }
 }
 
 /// A `PostProcessor` has the responsibility to post process an encoded output of the `Tokenizer`.
@@ -358,8 +382,6 @@ where
             added_vocabulary: self.added_vocabulary,
             truncation: self.truncation,
             padding: self.padding,
-
-            cached_max_token_byte_length: OnceLock::new(),
         })
     }
 
@@ -493,7 +515,6 @@ where
             added_vocabulary: t.added_vocabulary,
             padding: t.padding,
             truncation: t.truncation,
-            cached_max_token_byte_length: t.cached_max_token_byte_length,
         })
     }
 }
@@ -538,9 +559,6 @@ pub struct TokenizerImpl<M, N, PT, PP, D> {
     // General processing parameters
     truncation: Option<TruncationParams>,
     padding: Option<PaddingParams>,
-
-    // Cached values for performance
-    cached_max_token_byte_length: OnceLock<usize>,
 }
 
 impl<M, N, PT, PP, D> TokenizerImpl<M, N, PT, PP, D>
@@ -564,8 +582,6 @@ where
 
             truncation: None,
             padding: None,
-
-            cached_max_token_byte_length: OnceLock::new(),
         }
     }
 
@@ -1373,204 +1389,6 @@ where
             .into_maybe_par_iter()
             .map(|sentence| self.decode(sentence, skip_special_tokens))
             .collect()
-    }
-
-    /// Get the maximum token byte length from the model's vocabulary, using a cached value
-    /// if available.
-    ///
-    /// This method lazily computes the maximum token length on first call and caches it
-    /// for subsequent calls, avoiding repeated iteration through the vocabulary.
-    fn get_max_token_byte_length(&self) -> usize {
-        *self.cached_max_token_byte_length.get_or_init(|| {
-            self.model.max_token_byte_length()
-        })
-    }
-
-    /// Encode a single long input using parallel processing.
-    ///
-    /// This method splits long inputs into overlapping chunks, encodes them in parallel,
-    /// and merges the results deterministically to produce output identical to serial encoding.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The text to encode
-    /// * `add_special_tokens` - Whether to add special tokens
-    ///
-    /// # Behavior
-    ///
-    /// - For short inputs (< 10,000 bytes), falls back to serial encoding
-    /// - For long inputs, uses two-way parallelism to encode overlapping chunks
-    /// - Respects the `TOKENIZERS_PARALLELISM` environment variable
-    /// - Produces identical results to `encode()` but faster for long inputs
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use tokenizers::Tokenizer;
-    /// # use tokenizers::models::bpe::BPE;
-    /// # let tokenizer = Tokenizer::new(BPE::default());
-    /// let long_text = "Hello world! ".repeat(1000);
-    /// let encoding = tokenizer.encode_parallel_single(&long_text, false).unwrap();
-    /// assert!(encoding.get_ids().len() >= 0);
-    /// ```
-    pub fn encode_parallel_single(
-        &self,
-        input: impl AsRef<str>,
-        add_special_tokens: bool,
-    ) -> Result<Encoding> {
-        use crate::tokenizer::parallel_encode::{encode_parallel_single, ParallelConfig};
-
-        let input = input.as_ref();
-        let max_token_len = self.get_max_token_byte_length();
-        let config = ParallelConfig::default();
-
-        // Create closures that capture self
-        let encode_fn = |text: &str, add_special: bool| -> Result<Encoding> {
-            self.encode(text, add_special)
-        };
-
-        let post_process_fn = |encoding: Encoding,
-                                pair: Option<Encoding>,
-                                add_special: bool|
-         -> Result<Encoding> { self.post_process(encoding, pair, add_special) };
-
-        encode_parallel_single(
-            encode_fn,
-            post_process_fn,
-            max_token_len,
-            input,
-            add_special_tokens,
-            config,
-        )
-    }
-
-    /// Encode a single long input using cache-block streaming mode.
-    ///
-    /// This method is optimized for very large inputs (4MB+) by processing
-    /// them in L2-cache-sized blocks (~128KB) with small overlap windows.
-    /// This provides better cache locality than recursive splitting for
-    /// massive inputs.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The text to encode
-    /// * `add_special_tokens` - Whether to add special tokens
-    ///
-    /// # Behavior
-    ///
-    /// - Processes input in ~128KB blocks that fit in L2 cache
-    /// - Uses 1KB overlap windows to handle token boundaries
-    /// - Streams results directly to output to avoid memory fragmentation
-    /// - Best for inputs 4MB+ where cache thrashing is a concern
-    ///
-    /// # Performance
-    ///
-    /// - **30-50% faster** for 4MB+ inputs compared to recursive mode
-    /// - **20-40% fewer cache misses** due to streaming design
-    /// - For inputs < 4MB, use `encode_parallel_single()` instead
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use tokenizers::Tokenizer;
-    /// # use tokenizers::models::bpe::BPE;
-    /// # let tokenizer = Tokenizer::new(BPE::default());
-    /// let huge_text = "Hello world! ".repeat(500000); // ~6.5MB
-    /// let encoding = tokenizer.encode_streaming(&huge_text, false).unwrap();
-    /// ```
-    pub fn encode_streaming(
-        &self,
-        input: impl AsRef<str>,
-        add_special_tokens: bool,
-    ) -> Result<Encoding> {
-        use crate::tokenizer::parallel_encode::{encode_parallel_single, ParallelConfig, ParallelMode};
-
-        let input = input.as_ref();
-        let max_token_len = self.get_max_token_byte_length();
-
-        // Force streaming mode
-        let config = ParallelConfig {
-            mode: ParallelMode::Streaming,
-            ..ParallelConfig::default()
-        };
-
-        let encode_fn = |text: &str, add_special: bool| -> Result<Encoding> {
-            self.encode(text, add_special)
-        };
-
-        let post_process_fn = |encoding: Encoding,
-                                pair: Option<Encoding>,
-                                add_special: bool|
-         -> Result<Encoding> { self.post_process(encoding, pair, add_special) };
-
-        encode_parallel_single(
-            encode_fn,
-            post_process_fn,
-            max_token_len,
-            input,
-            add_special_tokens,
-            config,
-        )
-    }
-
-    /// Encode a single long input with custom parallel configuration.
-    ///
-    /// This method allows fine-grained control over the parallel encoding
-    /// strategy, including mode selection, block sizes, and thresholds.
-    ///
-    /// # Arguments
-    ///
-    /// * `input` - The text to encode
-    /// * `add_special_tokens` - Whether to add special tokens
-    /// * `config` - Custom parallel configuration
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use tokenizers::Tokenizer;
-    /// # use tokenizers::models::bpe::BPE;
-    /// use tokenizers::tokenizer::parallel_encode::{ParallelConfig, ParallelMode};
-    ///
-    /// # let tokenizer = Tokenizer::new(BPE::default());
-    /// let text = "Hello world! ".repeat(100000);
-    ///
-    /// // Use streaming mode with custom block size
-    /// let config = ParallelConfig {
-    ///     mode: ParallelMode::Streaming,
-    ///     block_size: 64 * 1024, // 64KB blocks
-    ///     ..ParallelConfig::default()
-    /// };
-    ///
-    /// let encoding = tokenizer.encode_parallel_with_config(&text, false, config).unwrap();
-    /// ```
-    pub fn encode_parallel_with_config(
-        &self,
-        input: impl AsRef<str>,
-        add_special_tokens: bool,
-        config: crate::tokenizer::parallel_encode::ParallelConfig,
-    ) -> Result<Encoding> {
-        use crate::tokenizer::parallel_encode::encode_parallel_single;
-
-        let input = input.as_ref();
-        let max_token_len = self.get_max_token_byte_length();
-
-        let encode_fn = |text: &str, add_special: bool| -> Result<Encoding> {
-            self.encode(text, add_special)
-        };
-
-        let post_process_fn = |encoding: Encoding,
-                                pair: Option<Encoding>,
-                                add_special: bool|
-         -> Result<Encoding> { self.post_process(encoding, pair, add_special) };
-
-        encode_parallel_single(
-            encode_fn,
-            post_process_fn,
-            max_token_len,
-            input,
-            add_special_tokens,
-            config,
-        )
     }
 
     /// Train our Model from files

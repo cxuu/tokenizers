@@ -1,5 +1,5 @@
 use crate::pre_tokenizers::unicode_scripts::scripts::{get_script, Script};
-use crate::tokenizer::{normalizer::Range, PreTokenizedString, PreTokenizer, Result};
+use crate::tokenizer::{normalizer::Range, Cut, PreTokenizedString, PreTokenizer, Result};
 use crate::utils::macro_rules_attribute;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +73,12 @@ impl PreTokenizer for UnicodeScripts {
                 })
                 .collect::<Vec<_>>())
         })
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        // Splits are processed independently, but leading spaces of a split are dropped, so a
+        // split can't be cut in two.
+        (cut == Cut::Boundary).then_some(Cut::Boundary)
     }
 }
 

@@ -206,6 +206,15 @@ impl Model for ModelWrapper {
             Self::Unigram(t) => t.get_trainer().into(),
         }
     }
+
+    fn supports_cut(&self, cut: crate::Cut) -> bool {
+        match self {
+            Self::WordLevel(t) => t.supports_cut(cut),
+            Self::WordPiece(t) => t.supports_cut(cut),
+            Self::BPE(t) => t.supports_cut(cut),
+            Self::Unigram(t) => t.supports_cut(cut),
+        }
+    }
 }
 
 impl ModelWrapper {

@@ -1,260 +1,104 @@
-# Parallel Single-Input Encoding
+# Parallel encoding of a single input
 
-## Overview
-
-This implementation adds parallel tokenization for single long inputs to the Rust tokenizers library, providing significant speedup for large documents while maintaining correctness guarantees.
-
-### Key Findings
-
-- **Sweet spot: 100KB-500KB** — Recursive parallelism achieves **1.7-2.1x** speedup
-- **Large inputs: 1MB+** — Streaming mode achieves **2.0-2.3x** consistent speedup
-- **Streaming beats recursive at 1MB+** — Default threshold set to 1MB
-- **Never slower than serial** — Safe to use for any input size
-
-Two parallel encoding strategies available:
-1. **Recursive Parallelism** — Best for 100KB-500KB (1.7-2.1x speedup)
-2. **Cache-Block Streaming** — Best for 1MB+ (2.0-2.3x consistent speedup)
-
-## Performance Optimizations
-
-### 1. SIMD-Accelerated Boundary Detection
-
-Uses the `memchr` crate for vectorized searching when finding split points:
+`encode_parallel_single` encodes one long input on multiple threads and returns exactly what
+`encode` returns: the same ids, tokens, offsets, word ids, masks, truncation and padding. It
+is not an approximation: it either proves a parallel strategy exact for the tokenizer, or
+uses a slower exact one.
 
 ```rust
-use memchr::memchr_iter;
-
-// 10-20x faster than byte-by-byte scanning for large inputs
-for pos in memchr_iter(b' ', &bytes[target..end]) {
-    // Process whitespace positions
-}
+let encoding = tokenizer.encode_parallel_single(&text, false)?; // == tokenizer.encode(&text, false)?
+let encoding = tokenizer.encode_parallel_single_char_offsets(&text, false)?; // == encode_char_offsets
+let config = ParallelConfig::default().with_min_input_bytes(64 * 1024);
+let encoding = tokenizer.encode_parallel_with_config(&text, false, &config)?;
+let plan = tokenizer.parallel_plan(); // Segments { inside }, Model or Serial
 ```
 
-Split point detection prioritizes **safe boundaries** in order:
-1. `\n\n` — Paragraph breaks (guaranteed token boundary)
-2. `. `, `.\n`, `! `, `!\n`, `? `, `?\n` — Sentence endings
-
-### 2. Minimal Overlap for Safe Boundaries
-
-When splitting at safe boundaries (sentence/paragraph ends), overlap is reduced by **80-90%**:
-
-| Boundary Type | Overlap Size |
-|--------------|--------------|
-| Safe (sentence/paragraph) | 100-500 bytes |
-| Regular (whitespace) | 500-5000 bytes |
-
-This significantly reduces redundant tokenization work:
-- With depth 4 recursion (16 chunks), regular overlap tokenizes ~5-15% extra bytes
-- Safe boundary detection reduces this to ~1-2% extra bytes
-
-### 3. Zero-Copy Offset Representation
-
-Uses `LazyEncoding` to defer offset operations until final materialization:
-
-```rust
-struct LazyEncoding {
-    encoding: Encoding,
-    base_offset: usize,  // O(1) shift instead of O(n)
-    start_idx: usize,    // O(log n) filter via binary search
-    end_idx: usize,      // No data copying until merge
-}
+```python
+encoding = tokenizer.encode_parallel(text)  # == tokenizer.encode(text)
 ```
 
-**Performance gains:**
-- `shift_all_offsets()`: O(n) → O(1)
-- `filter_tokens_starting_before/after()`: O(n) → O(log n)
-- With depth 4 recursion: **~30 O(n) passes → 1 O(n) pass**
+## How it works
 
-Only the final `materialize()` call performs actual data copying.
+The input is cut into segments that are encoded independently, then concatenated. A cut is
+only made at a space with an ASCII letter on each side (`a|␣b`), and only if every stage of
+the pipeline proves that encoding `input[..c]` and `input[c..]` separately gives the same
+result as encoding `input`. Each stage answers through a trait method whose default is "not
+provable", so custom components never get cut:
 
-### 4. Zero-Cost Validation in Release
+| Stage | Method | Proven safe |
+|---|---|---|
+| Normalizer | `map_cut_separator`, `normalize_continuation` | Per-char normalizers (BERT, NFC/NFD/NFKC/NFKD, Lowercase, StripAccents, Nmt, ByteLevel), `Precompiled` when it keeps ASCII letters and the space as single chars, `Replace` with a literal that can't touch the cut or replaces the space by one char, or with `" {2,}"` / `\s+`, `Strip`, `Prepend` (skipped at the start of a segment) |
+| Added tokens | `AddedVocabulary::supports_cut` | No pattern in the matchers ends with an ASCII letter or can match across the separator |
+| Pre-tokenizer | `map_cut` | BERT, Whitespace(Split), ByteLevel, Metaspace, Punctuation, Digits, CharDelimiterSplit, Sequence, `Split` with a literal or with an allowlisted regex (GPT-2, cl100k, o200k, Qwen 2, DeepSeek, BLOOM, CLIP, ...) |
+| Model | `supports_cut` | Any deterministic model when the cut is a split boundary; BPE with an unknown token inside a split when no merge can join a symbol ending with a letter to one starting with the separator |
 
-Debug/test builds validate parallel results against serial encoding. Release builds skip this entirely:
+When the pre-tokenizer doesn't split at the cut (Llama 2, Mistral, Gemma: no pre-tokenizer
+or Metaspace without split), the cut falls inside a split, and only BPE qualifies: its merge
+table is checked once (and cached) for a merge that could cross the cut. It needs an unknown
+token, since without one unknown chars are dropped and the offsets after them lag.
 
-```rust
-#[cfg(not(any(test, debug_assertions)))]
-let should_validate = false; // Zero cost - no env var check
-```
+Segments are encoded as slices of the input that keep global offsets, so offsets come out
+right without shifting and offset-dependent stages (Metaspace `First`) behave as in serial.
+Word ids are rebased per segment, and post-processing (special tokens, truncation, padding)
+runs once on the concatenation.
 
-## Algorithms
+Two things are checked at every cut, falling back to serial encoding when they fail:
 
-### Strategy 1: Recursive Parallelism (<1MB)
+- The rules assume the normalized text around the cut is still an ASCII letter, the
+  separator, an ASCII letter. Normalizers can combine the letter after the separator with
+  what follows (NFC turns `e` and U+0301 into `é`), so both segments check this shape after
+  normalization, each char aligned with its original byte.
+- Some normalizers carry alignment errors along a string: `Precompiled` drops the removal of
+  a first char, so every following offset lags. Alignments only lag, so the letter before
+  the cut must still be aligned with its original byte after pre-tokenization.
 
-Divide-and-conquer approach for medium inputs:
+If anything errors, encoding falls back to serial to return the same error.
 
-1. **Auto-tune** recursion depth based on input size and CPU cores
-2. **Find safe split points** using SIMD search for sentence/paragraph boundaries
-3. **Recursively split** input with minimal overlap at safe boundaries
-4. **Encode chunks** in parallel using `rayon::join`
-5. **Filter and merge** tokens using `LazyEncoding` (O(log n) binary search)
-6. **Materialize** offsets only once at the final merge
+When no cut is provable (or the input has no `a␣b`, like Chinese text), the input is
+pre-tokenized serially and only the model runs in parallel over the splits (`Model`). BPE
+with dropout encodes serially.
 
-**Key optimizations**:
-- Safe boundary splitting reduces overlap from 500-5000 bytes to 100-500 bytes (80-90% less redundant work)
-- `LazyEncoding` defers offset operations, turning O(n × depth) into O(n) total
+## Coverage
 
-**Best for**: 100KB-1MB inputs
+Of 56 `tokenizer.json` files from the Hub, 54 get segments, 7 of them with cuts inside splits
+(Llama 2, CodeLlama, TinyLlama, Phi-3, Mistral 7B, Gemma 2 and 3). CamemBERT and mBART-50 use
+the `Model` strategy because they have added tokens ending with a letter (`<s>NOTUSED`,
+`en_XX`). Run `cargo run --release --example parallel_plans -- <files>` to see the strategy
+of any tokenizer.
 
-### Strategy 2: Cache-Block Streaming (≥1MB)
+## Testing
 
-Cache-optimized approach for large inputs:
-
-```
-┌─────────────────────────────────────────────────────┐
-│                    1MB+ Input                       │
-├────────┬────────┬────────┬────────┬────────┬───────┤
-│Block 0 │Block 1 │Block 2 │Block 3 │Block 4 │ ...   │
-│ 128KB  │ 128KB  │ 128KB  │ 128KB  │ 128KB  │       │
-└────────┴────────┴────────┴────────┴────────┴───────┘
-```
-
-**Why streaming wins at 1MB+**:
-- Each 128KB block fits in L2 cache
-- Sequential memory access = prefetcher works optimally
-- Parallel block processing
-- Consistent 2.0-2.3x speedup at all sizes
-
-### Auto Mode (Default)
-
-Automatically selects:
-- **<1MB**: Recursive parallelism
-- **≥1MB**: Cache-Block Streaming
-
-## API
-
-```rust
-impl Tokenizer {
-    /// Encode with automatic mode selection (recommended)
-    pub fn encode_parallel_single(
-        &self,
-        input: impl AsRef<str>,
-        add_special_tokens: bool,
-    ) -> Result<Encoding>
-
-    /// Force streaming mode
-    pub fn encode_streaming(
-        &self,
-        input: impl AsRef<str>,
-        add_special_tokens: bool,
-    ) -> Result<Encoding>
-
-    /// Use custom configuration
-    pub fn encode_parallel_with_config(
-        &self,
-        input: impl AsRef<str>,
-        add_special_tokens: bool,
-        config: ParallelConfig,
-    ) -> Result<Encoding>
-}
-```
-
-### Configuration
-
-```rust
-pub struct ParallelConfig {
-    pub threshold: usize,           // Min size for parallel (default: 10KB)
-    pub mode: ParallelMode,         // Auto, Recursive, or Streaming
-    pub block_size: usize,          // Streaming block size (default: 128KB)
-    pub streaming_threshold: usize, // Switch to streaming at (default: 1MB)
-    pub safety_margin: usize,       // Extra overlap bytes (default: 64)
-}
-```
-
-**Smart overlap sizing**: The actual overlap used depends on the split point type:
-- Safe boundaries (sentence/paragraph ends): `max_token_len + safety_margin` (100-500 bytes)
-- Regular whitespace boundaries: `max_token_len × 3` (500-5000 bytes)
+- `tests/parallel_single_encode.rs` compares every field of the encoding with `encode`,
+  `encode_char_offsets` and `encode_fast`, with and without special tokens, truncation and
+  padding, on adversarial and seeded random inputs, cutting at every possible space. It uses
+  `data/*.json` and any `tokenizer.json` in `data/parallel_corpus/`. Set
+  `PARALLEL_FUZZ_CASES` for more random inputs.
+- `tests/parallel_redteam.rs` builds tokenizers from every normalizer, pre-tokenizer, model
+  and added-token flag, alone and combined, plus regression tests for the mismatches it found
+  (combining letters after the separator, BPE dropping unknown chars, a stale added-token
+  matcher after changing the normalizer).
+- `bindings/python/tests/bindings/test_parallel_encoding.py` does the same from Python.
 
 ## Performance
 
-### Benchmark Results
+Apple M-series, 12 cores, release build, `data/big.txt`, byte offsets (`cargo bench --bench
+parallel_single_benchmark`):
 
-| Input Size | Recursive | Streaming | Auto Mode |
-|------------|-----------|-----------|-----------|
-| 100KB | **1.68x** | 0.98x | Recursive |
-| 250KB | **2.09x** | 1.50x | Recursive |
-| 500KB | **1.89x** | 1.88x | ~Tie |
-| 1MB | 1.93x | **2.17x** | **Streaming** |
-| 2MB | 2.20x | **2.29x** | **Streaming** |
-| 4MB | 2.16x | **2.22x** | **Streaming** |
-| 8MB | 2.06x | **2.09x** | **Streaming** |
+| Tokenizer | 100 KB | 500 KB | 1 MB | 4 MB |
+|---|---|---|---|---|
+| BERT | 2.5x | 4.0x | 4.3x | 4.6x |
+| Llama 3 | 3.8x | 4.6x | 4.8x | 4.8x |
+| ALBERT (Unigram) | 2.6x | 3.2x | 4.0x | 3.5x |
+| RoBERTa | 2.3x | 2.5x | 2.6x | 2.6x |
 
-### Why Streaming Beats Recursive at 1MB+
+From Python (`benches/bench_parallel_single.py`, char offsets), 4 MB: GPT-2 3.3x, Qwen 2.5
+3.2x, gpt-4o 3.1x, T5 3.7x, Gemma 2 3.6x, Llama 2 6.3x.
 
-**Recursive at large sizes**:
-- Multiple threads access scattered memory regions
-- Good speedup (2.0-2.2x) but streaming is slightly better
-- L3 cache pressure at very large sizes
+Encoding one segment per thread isn't enough to use all cores well, since segments differ in
+cost; `segments_per_thread` (default 4) balances the load. Inputs under `min_input_bytes`
+(default 32 KB) are encoded serially.
 
-**Streaming at large sizes**:
-- Each block fits in L2 cache
-- Sequential access within blocks
-- Parallel block processing
-- **Result**: 2.0-2.3x consistent speedup
-
-## Correctness
-
-### Guarantees
-✅ Token IDs identical to serial
-✅ Tokens identical to serial
-✅ Offsets identical to serial
-✅ Decode consistency
-
-### Not Computed (Performance)
-❌ Word IDs not computed (use serial if needed)
-
-### Fallback
-Automatically falls back to serial if:
-- Input < 10KB
-- Parallelism disabled
-- Validation fails (debug builds)
-
-## Usage Examples
-
-```rust
-// Recommended: Auto mode
-let encoding = tokenizer.encode_parallel_single(&text, false)?;
-
-// Force streaming for any size
-let encoding = tokenizer.encode_streaming(&text, false)?;
-
-// Custom configuration
-use tokenizers::tokenizer::parallel_encode::{ParallelConfig, ParallelMode};
-
-let config = ParallelConfig {
-    mode: ParallelMode::Streaming,
-    block_size: 64 * 1024,
-    ..ParallelConfig::default()
-};
-let encoding = tokenizer.encode_parallel_with_config(&text, false, config)?;
-```
-
-## Summary
-
-| Input Size | Best Mode | Speedup |
-|------------|-----------|---------|
-| <50KB | Serial | 1.0x |
-| 50KB-500KB | Recursive | **1.7-2.1x** |
-| 500KB-1MB | Either | **~1.9x** |
-| 1MB+ | Streaming | **2.0-2.3x** |
-
-**Key insight**: Both modes achieve excellent speedup (~2x). Streaming provides slightly better and more consistent performance for large inputs (1MB+).
-
-## Dependencies
-
-The parallel encoding module uses:
-- `rayon` — Work-stealing parallel execution
-- `memchr` — SIMD-accelerated byte searching (AVX2/SSE2)
-
-## Debug Mode
-
-Set `DEBUG_PARALLEL=1` to enable verbose logging:
-
-```bash
-DEBUG_PARALLEL=1 cargo test parallel
-```
-
-This shows:
-- Split point detection (safe vs regular boundaries)
-- Overlap sizes used at each split
-- Token counts before/after filtering
-- Streaming block progress
+The model is only 10-30% of serial encoding time, which is why cutting the raw text matters:
+`cargo run --release --example phase_breakdown -- data/llama-3-tokenizer.json data/big.txt
+4000000` times each step. From Python, each model call takes a shared lock in the bindings,
+which limits scaling compared to Rust.

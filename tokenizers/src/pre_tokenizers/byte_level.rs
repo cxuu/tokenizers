@@ -5,7 +5,7 @@ use crate::utils::SysRegex;
 use serde::{Deserialize, Serialize};
 
 use crate::tokenizer::{
-    Decoder, Encoding, PostProcessor, PreTokenizedString, PreTokenizer, Result,
+    Cut, Decoder, Encoding, PostProcessor, PreTokenizedString, PreTokenizer, Result,
     SplitDelimiterBehavior,
 };
 use crate::utils::macro_rules_attribute;
@@ -144,6 +144,20 @@ impl PreTokenizer for ByteLevel {
             normalized.transform(transformations, 0);
             Ok(())
         })
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        match cut {
+            Cut::Boundary => Some(Cut::Boundary),
+            // The split right of the cut starts with the separator, and must not get a prefix.
+            Cut::Inside { sep } if self.add_prefix_space && sep != ' ' => None,
+            // See `SPACE_LED_REGEXES` in `split.rs`, which includes this regex.
+            Cut::Inside { sep } if self.use_regex => (sep == ' ').then_some(Cut::Boundary),
+            // Bytes are mapped one by one, and ASCII letters to themselves.
+            Cut::Inside { sep } => sep.is_ascii().then(|| Cut::Inside {
+                sep: BYTES_CHAR[&(sep as u8)],
+            }),
+        }
     }
 }
 

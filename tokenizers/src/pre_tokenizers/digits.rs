@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
+use crate::tokenizer::{Cut, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
 use crate::utils::macro_rules_attribute;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +34,14 @@ impl PreTokenizer for Digits {
             pretokenized.split(|_, normalized| {
                 normalized.split(char::is_numeric, SplitDelimiterBehavior::Contiguous)
             })
+        }
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        // Letters aren't numeric, so with a non-numeric separator nothing is matched near the cut.
+        match cut {
+            Cut::Inside { sep } if sep.is_numeric() => None,
+            cut => Some(cut),
         }
     }
 }

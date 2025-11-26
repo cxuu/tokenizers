@@ -200,6 +200,44 @@ impl Normalizer for NormalizerWrapper {
             Self::ByteLevel(lc) => lc.normalize(normalized),
         }
     }
+
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> crate::Result<()> {
+        match self {
+            Self::BertNormalizer(bn) => bn.normalize_continuation(normalized),
+            Self::StripNormalizer(sn) => sn.normalize_continuation(normalized),
+            Self::StripAccents(sn) => sn.normalize_continuation(normalized),
+            Self::NFC(nfc) => nfc.normalize_continuation(normalized),
+            Self::NFD(nfd) => nfd.normalize_continuation(normalized),
+            Self::NFKC(nfkc) => nfkc.normalize_continuation(normalized),
+            Self::NFKD(nfkd) => nfkd.normalize_continuation(normalized),
+            Self::Sequence(sequence) => sequence.normalize_continuation(normalized),
+            Self::Lowercase(lc) => lc.normalize_continuation(normalized),
+            Self::Nmt(lc) => lc.normalize_continuation(normalized),
+            Self::Precompiled(lc) => lc.normalize_continuation(normalized),
+            Self::Replace(lc) => lc.normalize_continuation(normalized),
+            Self::Prepend(lc) => lc.normalize_continuation(normalized),
+            Self::ByteLevel(lc) => lc.normalize_continuation(normalized),
+        }
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        match self {
+            Self::BertNormalizer(bn) => bn.map_cut_separator(sep),
+            Self::StripNormalizer(sn) => sn.map_cut_separator(sep),
+            Self::StripAccents(sn) => sn.map_cut_separator(sep),
+            Self::NFC(nfc) => nfc.map_cut_separator(sep),
+            Self::NFD(nfd) => nfd.map_cut_separator(sep),
+            Self::NFKC(nfkc) => nfkc.map_cut_separator(sep),
+            Self::NFKD(nfkd) => nfkd.map_cut_separator(sep),
+            Self::Sequence(sequence) => sequence.map_cut_separator(sep),
+            Self::Lowercase(lc) => lc.map_cut_separator(sep),
+            Self::Nmt(lc) => lc.map_cut_separator(sep),
+            Self::Precompiled(lc) => lc.map_cut_separator(sep),
+            Self::Replace(lc) => lc.map_cut_separator(sep),
+            Self::Prepend(lc) => lc.map_cut_separator(sep),
+            Self::ByteLevel(lc) => lc.map_cut_separator(sep),
+        }
+    }
 }
 
 impl_enum_from!(BertNormalizer, NormalizerWrapper, BertNormalizer);

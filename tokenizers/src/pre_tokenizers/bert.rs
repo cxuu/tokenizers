@@ -1,4 +1,4 @@
-use crate::tokenizer::{PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
+use crate::tokenizer::{Cut, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
 use crate::utils::macro_rules_attribute;
 use unicode_categories::UnicodeCategories;
 
@@ -14,6 +14,14 @@ impl PreTokenizer for BertPreTokenizer {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         pretokenized.split(|_, s| s.split(char::is_whitespace, SplitDelimiterBehavior::Removed))?;
         pretokenized.split(|_, s| s.split(is_bert_punc, SplitDelimiterBehavior::Isolated))
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        // Both splits work char by char, and letters are neither whitespace nor punctuation.
+        Some(match cut {
+            Cut::Inside { sep } if sep.is_whitespace() || is_bert_punc(sep) => Cut::Boundary,
+            cut => cut,
+        })
     }
 }
 

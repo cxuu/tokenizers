@@ -1,3 +1,4 @@
+use crate::utils::parallelism::*;
 use crate::{
     normalizer::Range, Encoding, NormalizedString, OffsetReferential, Offsets, Result, Token,
 };
@@ -124,6 +125,62 @@ impl PreTokenizedString {
         }
 
         Ok(())
+    }
+
+    /// Like `tokenize`, using multiple threads. Returns the same error as `tokenize`.
+    pub(crate) fn tokenize_parallel<F>(&mut self, tokenize: F) -> Result<()>
+    where
+        F: Fn(&NormalizedString) -> Result<Vec<Token>> + Sync,
+    {
+        let results = self
+            .splits
+            .maybe_par_iter()
+            .map(|split| match split.tokens {
+                Some(_) => Ok(None),
+                None => tokenize(&split.normalized).map(Some),
+            })
+            .collect::<Vec<_>>();
+        for (split, result) in self.splits.iter_mut().zip(results) {
+            if let Some(tokens) = result? {
+                split.tokens = Some(tokens);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the last split is untokenized text ending with an ASCII letter aligned with the
+    /// original byte right before `end`. Lagging alignments also shift the original range of a
+    /// split, so its `offsets_original` can't be trusted to tell where it ends.
+    pub(crate) fn ends_with_cut(&self, end: usize) -> bool {
+        let Some(split) = self.splits.last() else {
+            return false;
+        };
+        let start = split.normalized.offsets_original().0;
+        let n = split.normalized.len();
+        split.tokens.is_none()
+            && n > 0
+            && split.normalized.get().as_bytes()[n - 1].is_ascii_alphabetic()
+            && split
+                .normalized
+                .convert_offsets(Range::Normalized(n - 1..n))
+                .is_some_and(|r| (start + r.start, start + r.end) == (end - 1, end))
+    }
+
+    /// For a string covering `start..end` of the original input: the number of splits,
+    /// whether the first split is untokenized text starting at `start`, and whether the
+    /// last split is untokenized text ending at `end`.
+    pub(crate) fn edges(&self, start: usize, end: usize) -> (usize, bool, bool) {
+        let text_at = |split: Option<&Split>, at_end: bool| {
+            split.is_some_and(|split| {
+                let (s, e) = split.normalized.offsets_original();
+                split.tokens.is_none() && if at_end { e == end } else { s == start }
+            })
+        };
+        (
+            self.splits.len(),
+            text_at(self.splits.first(), false),
+            text_at(self.splits.last(), true),
+        )
     }
 
     /// Transform the current `PreTokenizedString` into an `Encoding`.
@@ -264,7 +321,7 @@ impl From<String> for PreTokenizedString {
     }
 }
 
-struct BytesToCharOffsetConverter {
+pub(crate) struct BytesToCharOffsetConverter {
     map: HashMap<usize, usize>,
 }
 

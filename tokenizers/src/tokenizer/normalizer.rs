@@ -131,6 +131,13 @@ impl NormalizedString {
             original_shift,
         }
     }
+    /// Make offsets in the original referential start at `shift`, as for a slice of a longer
+    /// string starting at that byte.
+    pub(crate) fn with_original_shift(mut self, shift: usize) -> Self {
+        self.original_shift = shift;
+        self
+    }
+
     /// Return the normalized string
     pub fn get(&self) -> &str {
         &self.normalized

@@ -46,6 +46,19 @@ impl Normalizer for Sequence {
         }
         Ok(())
     }
+
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> Result<()> {
+        for normalizer in &self.normalizers {
+            normalizer.normalize_continuation(normalized)?;
+        }
+        Ok(())
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        self.normalizers
+            .iter()
+            .try_fold(sep, |sep, normalizer| normalizer.map_cut_separator(sep))
+    }
 }
 
 /// Lowercases the input
@@ -56,5 +69,14 @@ impl Normalizer for Lowercase {
     fn normalize(&self, normalized: &mut NormalizedString) -> Result<()> {
         normalized.lowercase();
         Ok(())
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        // `lowercase` maps each char on its own, and ASCII letters to ASCII letters.
+        let mut lower = sep.to_lowercase();
+        match (lower.next(), lower.next()) {
+            (Some(c), None) => Some(c),
+            _ => None,
+        }
     }
 }

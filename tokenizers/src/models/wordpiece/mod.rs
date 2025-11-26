@@ -2,7 +2,7 @@
 //! model.
 
 use crate::models::bpe::BPE;
-use crate::tokenizer::{Model, Result, Token};
+use crate::tokenizer::{Cut, Model, Result, Token};
 use ahash::AHashMap;
 use std::collections::HashMap;
 use std::{
@@ -219,6 +219,10 @@ impl Model for WordPiece {
 
     fn get_vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    fn supports_cut(&self, cut: Cut) -> bool {
+        cut == Cut::Boundary
     }
 
     fn tokenize(&self, sequence: &str) -> Result<Vec<Token>> {

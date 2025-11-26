@@ -104,6 +104,19 @@ fn ends_with_word(sentence: &str) -> bool {
     ENDS_WITH_WORD.is_match(sentence)
 }
 
+/// See `AddedVocabulary::supports_cut`. The text around the cut is: an ASCII letter, the cut,
+/// `sep`, an ASCII letter. A pattern that doesn't end with a letter can't end at the cut, so
+/// `rstrip` and the `single_word` check after a match never look across it. A match starting
+/// right after `sep` sees `sep` before it on both sides of the cut.
+fn pattern_supports_cut(pattern: &str, sep: char) -> bool {
+    let chars: Vec<char> = pattern.chars().collect();
+    let letter = |i: usize| chars[i].is_ascii_alphabetic();
+    let n = chars.len();
+    let covers_sep = (0..n)
+        .any(|k| chars[k] == sep && (k == 0 || letter(k - 1)) && (k + 1 == n || letter(k + 1)));
+    n > 0 && !letter(n - 1) && !covers_sep
+}
+
 fn starts_with_word(sentence: &str) -> bool {
     STARTS_WITH_WORD.is_match(sentence)
 }
@@ -159,6 +172,9 @@ pub struct AddedVocabulary {
     split_trie: MatchingSet,
     /// A RegexSet containing all the normalized patterns used to split on AddedTokens
     split_normalized_trie: MatchingSet,
+    /// The patterns of `split_trie` and `split_normalized_trie`. The normalized ones were
+    /// normalized when the tries were built, maybe by a normalizer that has since changed.
+    split_patterns: (Vec<String>, Vec<String>),
 
     /// Whether or not special tokens should be splitted when encoding. This is equivalent to ignoring them
     encode_special_tokens: bool,
@@ -182,6 +198,7 @@ impl AddedVocabulary {
             special_tokens_set: AHashSet::new(),
             split_trie: (trie, vec![]),
             split_normalized_trie: (normalized_trie, vec![]),
+            split_patterns: (vec![], vec![]),
             encode_special_tokens: false,
         }
     }
@@ -358,6 +375,13 @@ impl AddedVocabulary {
             .build(patterns.iter().map(|content| content.get()))
             .expect("Failed to build tried when refreshing tokens (normalized)");
         self.split_normalized_trie = (normalized_trie, nids);
+        self.split_patterns = (
+            tokens.iter().map(|token| token.content.clone()).collect(),
+            patterns
+                .iter()
+                .map(|content| content.get().to_owned())
+                .collect(),
+        );
     }
 
     /// Find any AddedToken in the given sentence, using the provided MatchingSet.
@@ -457,6 +481,34 @@ impl AddedVocabulary {
         normalizer: Option<&N>,
         sequence: &str,
     ) -> PreTokenizedString {
+        self.extract_and_normalize_string(normalizer, sequence.into(), None)
+            .0
+    }
+
+    /// Whether a cut at a space between two ASCII letters (see `parallel_encode`) can't change
+    /// any match: no token matches across it, and no match ending or starting next to it
+    /// changes depending on the other side. `sep` is what the normalizer turns that space into,
+    /// with ASCII letters still around it.
+    pub(crate) fn supports_cut(&self, sep: char) -> bool {
+        let (patterns, normalized_patterns) = &self.split_patterns;
+        patterns.iter().all(|p| pattern_supports_cut(p, ' '))
+            && normalized_patterns
+                .iter()
+                .all(|p| pattern_supports_cut(p, sep))
+    }
+
+    /// Like `extract_and_normalize`. With `continuation: Some(sep)`, `sequence` starts with a
+    /// space and an ASCII letter and directly follows text encoded separately, so a first piece
+    /// starting at its beginning is normalized with `Normalizer::normalize_continuation`.
+    /// Returns whether that piece, if any, then starts with `sep` and an ASCII letter, each
+    /// aligned with one original byte.
+    pub(crate) fn extract_and_normalize_string<N: Normalizer>(
+        &self,
+        normalizer: Option<&N>,
+        sequence: NormalizedString,
+        continuation: Option<char>,
+    ) -> (PreTokenizedString, bool) {
+        let mut starts_as_expected = true;
         let mut pretokenized: PreTokenizedString = sequence.into();
 
         // 1. We extract all the non-normalized tokens from the non-normalized string
@@ -478,8 +530,16 @@ impl AddedVocabulary {
         //                                         320055
         // 2. Then extract the normalized tokens from the normalized pieces of the string
         pretokenized
-            .split(|_, mut sequence| {
-                normalizer.map(|n| n.normalize(&mut sequence));
+            .split(|i, mut sequence| {
+                match continuation {
+                    Some(sep) if i == 0 => {
+                        normalizer.map(|n| n.normalize_continuation(&mut sequence));
+                        starts_as_expected = starts_with_cut(&sequence, sep);
+                    }
+                    _ => {
+                        normalizer.map(|n| n.normalize(&mut sequence));
+                    }
+                }
                 Ok(self.split_with_indices(sequence, &self.split_normalized_trie))
             })
             .expect("AddedVocabulary bad split");
@@ -492,8 +552,21 @@ impl AddedVocabulary {
 
         // "I read a " "[DAY]", "book monday" -> "i read a " "[day]", "book monday"
 
-        pretokenized
+        (pretokenized, starts_as_expected)
     }
+}
+
+/// Whether `normalized` starts with `sep` then an ASCII letter, each aligned with exactly one
+/// original byte, the first two.
+fn starts_with_cut(normalized: &NormalizedString, sep: char) -> bool {
+    let s = normalized.get();
+    let sep_len = sep.len_utf8();
+    s.starts_with(sep)
+        && s.as_bytes()
+            .get(sep_len)
+            .is_some_and(u8::is_ascii_alphabetic)
+        && normalized.convert_offsets(Range::Normalized(0..sep_len)) == Some(0..1)
+        && normalized.convert_offsets(Range::Normalized(sep_len..sep_len + 1)) == Some(1..2)
 }
 
 impl Default for AddedVocabulary {

@@ -1,4 +1,6 @@
-use crate::tokenizer::{Decoder, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior};
+use crate::tokenizer::{
+    Cut, Decoder, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
+};
 use serde::{de, Deserialize, Deserializer, Serialize};
 
 /// Enum representing options for the metaspace prepending scheme.
@@ -143,6 +145,26 @@ impl PreTokenizer for Metaspace {
             } else {
                 Ok(vec![normalized])
             }
+        })
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        let Cut::Inside { sep } = cut else {
+            return Some(Cut::Boundary);
+        };
+        if self.replacement.is_ascii_alphabetic() {
+            return None;
+        }
+        let sep = if sep == ' ' { self.replacement } else { sep };
+        // The split right of the cut starts with the separator: `Always` prepends unless it is
+        // the replacement. `First` only prepends at original offset 0, never right of a cut.
+        if self.prepend_scheme == PrependScheme::Always && sep != self.replacement {
+            return None;
+        }
+        Some(if self.split && sep == self.replacement {
+            Cut::Boundary
+        } else {
+            Cut::Inside { sep }
         })
     }
 }

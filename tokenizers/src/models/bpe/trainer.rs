@@ -588,6 +588,7 @@ impl BpeTrainer {
 
         model.continuing_subword_prefix = self.continuing_subword_prefix.clone();
         model.end_of_word_suffix = self.end_of_word_suffix.clone();
+        model.merges_across = Default::default();
 
         Ok(self.special_tokens.clone())
     }

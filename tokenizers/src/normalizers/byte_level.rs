@@ -45,6 +45,11 @@ impl Normalizer for ByteLevel {
         }
         Ok(())
     }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        // Each byte maps to one char, and ASCII letters map to themselves.
+        sep.is_ascii().then(|| BYTES_CHAR[&(sep as u8)])
+    }
 }
 
 #[cfg(test)]

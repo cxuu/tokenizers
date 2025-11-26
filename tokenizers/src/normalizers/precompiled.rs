@@ -66,6 +66,34 @@ impl Normalizer for Precompiled {
         }
         Ok(())
     }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        // A space or '▁' between ASCII letters is a grapheme of its own, and so are the
+        // letters, so each of them is transformed on its own.
+        if !matches!(sep, ' ' | '▁') {
+            return None;
+        }
+        let map = |c: char| -> Option<char> {
+            match self.transform(c.encode_utf8(&mut [0; 4])) {
+                None => Some(c),
+                Some(norm) => {
+                    let mut chars = norm.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(c), None) => Some(c),
+                        _ => None,
+                    }
+                }
+            }
+        };
+        let letters_kept = ('a'..='z')
+            .chain('A'..='Z')
+            .all(|c| map(c).is_some_and(|m| m.is_ascii_alphabetic()));
+        if letters_kept {
+            map(sep)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]

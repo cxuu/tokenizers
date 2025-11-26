@@ -2,7 +2,7 @@ use crate::utils::SysRegex;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::tokenizer::{
-    pattern::Invert, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
+    pattern::Invert, Cut, PreTokenizedString, PreTokenizer, Result, SplitDelimiterBehavior,
 };
 
 /// Represents the different patterns that `Split` can use
@@ -93,12 +93,87 @@ impl Split {
     }
 }
 
+/// Regexes without lookbehind or anchors, where a space is only ever the first char of a
+/// match or part of a whitespace-only match. A match containing an ASCII letter therefore
+/// ends before a following space, and a space followed by an ASCII letter is either the start
+/// of a match or unmatched: such a space is always a split boundary, and matching restarts
+/// there exactly as at the start of a string.
+const SPACE_LED_REGEXES: &[&str] = &[
+    // GPT-2
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+",
+    // cl100k, Llama 3
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    // Qwen 2
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    // o200k, Llama 4
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    // Mistral Nemo
+    "[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    // DeepSeek V3
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+    // DeepSeek Coder
+    "\\s?\\p{L}+",
+    // BLOOM
+    " ?[^(\\s|[.,!?\u{2026}\u{3002}\u{ff0c}\u{3001}\u{964}\u{6d4}\u{60c}])]+",
+    // CLIP
+    "<\\|startoftext\\|>|<\\|endoftext\\|>|'s|'t|'re|'ve|'m|'ll|'d|[\\p{L}]+|[\\p{N}]|[^\\s\\p{L}\\p{N}]+",
+];
+
+/// Regexes without lookaround or anchors that can't match an ASCII letter, nor a space
+/// followed by an ASCII letter: no match touches a space between two ASCII letters.
+const SPACE_FREE_REGEXES: &[&str] = &[
+    "\\p{N}{1,3}",
+    "[0-9][0-9][0-9]",
+    "[\r\n]",
+    "\\s?\\p{P}+",
+    "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+",
+    "[\u{4e00}-\u{9fa5}\u{800}-\u{4e00}\u{ac00}-\u{d7ff}]+",
+];
+
 impl PreTokenizer for Split {
     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
         if self.invert {
             pretokenized.split(|_, normalized| normalized.split(Invert(&self.regex), self.behavior))
         } else {
             pretokenized.split(|_, normalized| normalized.split(&self.regex, self.behavior))
+        }
+    }
+
+    fn map_cut(&self, cut: Cut) -> Option<Cut> {
+        let Cut::Inside { sep } = cut else {
+            return Some(Cut::Boundary);
+        };
+        use SplitDelimiterBehavior::*;
+        match &self.pattern {
+            SplitPattern::String(pattern) => {
+                if self.invert {
+                    return None;
+                }
+                let mut chars = pattern.chars();
+                if chars.next() == Some(sep) && chars.next().is_none() {
+                    // The separator is a match of its own, between two letters.
+                    return (self.behavior != MergedWithPrevious).then_some(Cut::Boundary);
+                }
+                let reaches_cut = pattern.is_empty()
+                    || pattern.chars().any(|c| c == sep || c.is_ascii_alphabetic());
+                (!reaches_cut).then_some(cut)
+            }
+            SplitPattern::Regex(regex) if sep == ' ' => {
+                let regex = regex.as_str();
+                if SPACE_LED_REGEXES.contains(&regex)
+                    && matches!(
+                        (self.behavior, self.invert),
+                        (Isolated, false) | (Removed, true)
+                    )
+                {
+                    Some(Cut::Boundary)
+                } else if SPACE_FREE_REGEXES.contains(&regex) && !self.invert {
+                    Some(cut)
+                } else {
+                    None
+                }
+            }
+            SplitPattern::Regex(_) => None,
         }
     }
 }

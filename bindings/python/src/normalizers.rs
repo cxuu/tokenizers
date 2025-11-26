@@ -136,6 +136,14 @@ impl Normalizer for PyNormalizer {
     fn normalize(&self, normalized: &mut NormalizedString) -> tk::Result<()> {
         self.normalizer.normalize(normalized)
     }
+
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> tk::Result<()> {
+        self.normalizer.normalize_continuation(normalized)
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        self.normalizer.map_cut_separator(sep)
+    }
 }
 
 #[pymethods]
@@ -783,6 +791,29 @@ impl Normalizer for PyNormalizerTypeWrapper {
             }),
         }
     }
+
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> tk::Result<()> {
+        match self {
+            PyNormalizerTypeWrapper::Single(inner) => inner
+                .read()
+                .map_err(|_| PyException::new_err("RwLock synchronisation primitive is poisoned, cannot get subtype of PyNormalizer"))?
+                .normalize_continuation(normalized),
+            PyNormalizerTypeWrapper::Sequence(inner) => inner.iter().try_for_each(|n| {
+                n.read()
+                    .map_err(|_| PyException::new_err("RwLock synchronisation primitive is poisoned, cannot get subtype of PyNormalizer"))?
+                    .normalize_continuation(normalized)
+            }),
+        }
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        match self {
+            PyNormalizerTypeWrapper::Single(inner) => inner.read().ok()?.map_cut_separator(sep),
+            PyNormalizerTypeWrapper::Sequence(inner) => inner
+                .iter()
+                .try_fold(sep, |sep, n| n.read().ok()?.map_cut_separator(sep)),
+        }
+    }
 }
 
 impl Normalizer for PyNormalizerWrapper {
@@ -790,6 +821,20 @@ impl Normalizer for PyNormalizerWrapper {
         match self {
             PyNormalizerWrapper::Wrapped(inner) => inner.normalize(normalized),
             PyNormalizerWrapper::Custom(inner) => inner.normalize(normalized),
+        }
+    }
+
+    fn normalize_continuation(&self, normalized: &mut NormalizedString) -> tk::Result<()> {
+        match self {
+            PyNormalizerWrapper::Wrapped(inner) => inner.normalize_continuation(normalized),
+            PyNormalizerWrapper::Custom(inner) => inner.normalize(normalized),
+        }
+    }
+
+    fn map_cut_separator(&self, sep: char) -> Option<char> {
+        match self {
+            PyNormalizerWrapper::Wrapped(inner) => inner.map_cut_separator(sep),
+            PyNormalizerWrapper::Custom(_) => None,
         }
     }
 }
