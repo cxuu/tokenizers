@@ -530,6 +530,272 @@ impl Encoding {
             }
         }
     }
+
+    /// Keep only tokens that are completely before the given position (end <= position).
+    /// Used in parallel tokenization to keep left chunk tokens before the seam.
+    pub fn filter_tokens_ending_before(&mut self, position: usize) {
+        let keep: Vec<bool> = self
+            .offsets
+            .iter()
+            .map(|(_start, end)| *end <= position)
+            .collect();
+
+        if std::env::var("DEBUG_PARALLEL").is_ok() {
+            let removed_count = keep.iter().filter(|&&k| !k).count();
+            println!(
+                "[FILTER_ENDING_BEFORE] Position: {}, Keeping: {}/{}, Removing: {}",
+                position,
+                keep.iter().filter(|&&k| k).count(),
+                self.len(),
+                removed_count
+            );
+        }
+
+        self.filter_by_mask(&keep);
+    }
+
+    /// Keep only tokens that start at or after the given position (start >= position).
+    /// Used in parallel tokenization to keep right chunk tokens after the seam.
+    pub fn filter_tokens_starting_at_or_after(&mut self, position: usize) {
+        let keep: Vec<bool> = self
+            .offsets
+            .iter()
+            .map(|(start, _end)| *start >= position)
+            .collect();
+
+        if std::env::var("DEBUG_PARALLEL").is_ok() {
+            let removed_count = keep.iter().filter(|&&k| !k).count();
+            println!(
+                "[FILTER_STARTING_AT_OR_AFTER] Position: {}, Keeping: {}/{}, Removing: {}",
+                position,
+                keep.iter().filter(|&&k| k).count(),
+                self.len(),
+                removed_count
+            );
+        }
+
+        self.filter_by_mask(&keep);
+    }
+
+    /// Keep only tokens that start before the given position (start < position).
+    /// Used in parallel tokenization to keep left chunk tokens before the split point.
+    pub fn filter_tokens_starting_before(&mut self, position: usize) {
+        let keep: Vec<bool> = self
+            .offsets
+            .iter()
+            .map(|(start, _end)| *start < position)
+            .collect();
+
+        if std::env::var("DEBUG_PARALLEL").is_ok() {
+            let removed_count = keep.iter().filter(|&&k| !k).count();
+            println!(
+                "[FILTER_STARTING_BEFORE] Position: {}, Keeping: {}/{}, Removing: {}",
+                position,
+                keep.iter().filter(|&&k| k).count(),
+                self.len(),
+                removed_count
+            );
+        }
+
+        self.filter_by_mask(&keep);
+    }
+
+    /// Keep only tokens that do NOT overlap with the range [range_start, range_end).
+    /// A token overlaps if: token_start < range_end AND token_end > range_start
+    /// Used in parallel tokenization to filter out tokens that will be replaced by seam encoding.
+    pub fn filter_tokens_not_overlapping(&mut self, range_start: usize, range_end: usize) {
+        let keep: Vec<bool> = self
+            .offsets
+            .iter()
+            .map(|(start, end)| {
+                // Keep token if it doesn't overlap [range_start, range_end)
+                // No overlap means: token ends at or before range starts, OR token starts at or after range ends
+                *end <= range_start || *start >= range_end
+            })
+            .collect();
+
+        if std::env::var("DEBUG_PARALLEL").is_ok() {
+            let removed_count = keep.iter().filter(|&&k| !k).count();
+            println!(
+                "[FILTER_NOT_OVERLAPPING] Range: [{}, {}), Keeping: {}/{}, Removing: {}",
+                range_start,
+                range_end,
+                keep.iter().filter(|&&k| k).count(),
+                self.len(),
+                removed_count
+            );
+        }
+
+        self.filter_by_mask(&keep);
+    }
+
+    /// Keep only tokens where the offset end is less than or equal to the threshold.
+    /// Used in parallel tokenization to filter tokens before the seam region.
+    pub fn filter_tokens_before(&mut self, threshold: usize) {
+        let keep: Vec<bool> = self
+            .offsets
+            .iter()
+            .map(|(_, end)| *end <= threshold)
+            .collect();
+
+        if std::env::var("DEBUG_PARALLEL").is_ok() {
+            let removed_count = keep.iter().filter(|&&k| !k).count();
+            println!("[FILTER_BEFORE] Threshold: {}, Keeping: {}/{}, Removing: {}",
+                threshold, keep.iter().filter(|&&k| k).count(), self.len(), removed_count);
+        }
+
+        self.filter_by_mask(&keep);
+    }
+
+    /// Keep only tokens where the offset start is greater than or equal to the threshold.
+    /// Used in parallel tokenization to filter tokens after the seam region.
+    pub fn filter_tokens_after_relative(&mut self, threshold: usize) {
+        let keep: Vec<bool> = self
+            .offsets
+            .iter()
+            .map(|(start, _)| *start >= threshold)
+            .collect();
+
+        if std::env::var("DEBUG_PARALLEL").is_ok() {
+            let removed_count = keep.iter().filter(|&&k| !k).count();
+            println!("[FILTER_AFTER] Threshold: {}, Keeping: {}/{}, Removing: {}",
+                threshold, keep.iter().filter(|&&k| k).count(), self.len(), removed_count);
+        }
+
+        self.filter_by_mask(&keep);
+    }
+
+    /// Shift all offsets by a constant amount (can be positive or negative).
+    /// Used in parallel tokenization to adjust chunk-relative offsets to global offsets.
+    pub fn shift_all_offsets(&mut self, shift: isize) {
+        for (start, end) in &mut self.offsets {
+            *start = (*start as isize + shift) as usize;
+            *end = (*end as isize + shift) as usize;
+        }
+    }
+
+    /// Get the maximum word ID in this encoding (returns None if no word IDs present).
+    pub fn max_word_id(&self) -> Option<u32> {
+        self.words.iter().filter_map(|&w| w).max()
+    }
+
+    /// Shift all word IDs by a constant amount.
+    /// Note: Not currently used in parallel encoding (word IDs are not computed for performance).
+    pub fn shift_word_ids(&mut self, shift: u32) {
+        for word_id in &mut self.words {
+            if let Some(id) = word_id {
+                *id += shift;
+            }
+        }
+    }
+
+
+    /// Assign word IDs based on pre-computed word boundaries.
+    ///
+    /// Each token is mapped to a word based on which boundary contains its start offset.
+    /// This produces exact word IDs matching serial encoding.
+    ///
+    /// Note: Not currently used in parallel encoding (word IDs are not computed for performance).
+    ///
+    /// # Arguments
+    ///
+    /// * `boundaries` - List of (start, end) byte offsets for each word from pre-tokenization
+    pub fn assign_word_ids_from_boundaries(&mut self, boundaries: &[Offsets]) {
+        for (token_idx, &(token_start, _token_end)) in self.offsets.iter().enumerate() {
+            // Find which word boundary contains this token's start position
+            let word_id = boundaries
+                .iter()
+                .position(|&(word_start, word_end)| {
+                    token_start >= word_start && token_start < word_end
+                })
+                .map(|idx| idx as u32);
+
+            self.words[token_idx] = word_id;
+        }
+    }
+
+    /// Renumber word IDs based on offset continuity and token patterns.
+    ///
+    /// Assigns word IDs such that tokens are grouped into words based on:
+    /// - Offset continuity (no gap = might be same word)
+    /// - Token content (whitespace/punctuation likely starts new word)
+    ///
+    /// Note: Not currently used in parallel encoding (word IDs are not computed for performance).
+    /// The resulting word IDs may not exactly match serial encoding but will be semantically
+    /// reasonable and monotonic.
+    pub fn renumber_word_ids_by_offsets(&mut self) {
+        if self.offsets.is_empty() {
+            return;
+        }
+
+        let mut current_word_id = 0u32;
+        let mut last_offset_end = 0;
+
+        for i in 0..self.offsets.len() {
+            let (start, end) = self.offsets[i];
+            let token = &self.tokens[i];
+
+            // Determine if this starts a new word:
+            // 1. If there's an offset gap, definitely a new word
+            // 2. If token starts with special markers (##, Ġ prefix removed), likely same word
+            // 3. If previous token was punctuation or special, likely new word
+            // 4. First token is word 0
+            let is_new_word = if i == 0 {
+                false
+            } else if start > last_offset_end {
+                // Gap in offsets = new word
+                true
+            } else if token.starts_with("##") {
+                // WordPiece continuation - same word as previous
+                false
+            } else if i > 0 {
+                let prev_token = &self.tokens[i - 1];
+                // If previous token was punctuation, special token, or single char, start new word
+                if prev_token.starts_with("[") && prev_token.ends_with("]") {
+                    // Previous was special token like [UNK], [CLS], etc.
+                    true
+                } else if prev_token.len() <= 3 && prev_token.chars().all(|c| !c.is_alphanumeric()) {
+                    // Previous was short punctuation/symbol
+                    true
+                } else {
+                    // Default: same word (continuous text)
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_new_word {
+                current_word_id += 1;
+            }
+
+            if self.words[i].is_some() {
+                self.words[i] = Some(current_word_id);
+            }
+
+            last_offset_end = end;
+        }
+    }
+
+    /// Filter encoding fields based on a boolean mask.
+    fn filter_by_mask(&mut self, keep: &[bool]) {
+        let indices: Vec<usize> = keep
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &k)| if k { Some(i) } else { None })
+            .collect();
+
+        self.ids = indices.iter().map(|&i| self.ids[i]).collect();
+        self.tokens = indices.iter().map(|&i| self.tokens[i].clone()).collect();
+        self.offsets = indices.iter().map(|&i| self.offsets[i]).collect();
+        self.type_ids = indices.iter().map(|&i| self.type_ids[i]).collect();
+        self.words = indices.iter().map(|&i| self.words[i]).collect();
+        self.special_tokens_mask = indices
+            .iter()
+            .map(|&i| self.special_tokens_mask[i])
+            .collect();
+        self.attention_mask = indices.iter().map(|&i| self.attention_mask[i]).collect();
+    }
 }
 
 impl std::iter::FromIterator<Encoding> for Encoding {
