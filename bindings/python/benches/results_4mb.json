@@ -1,0 +1,67 @@
+{
+  "config": {
+    "input_size_mb": 4,
+    "warmup_iterations": 3,
+    "benchmark_iterations": 10,
+    "rayon_threads": null,
+    "use_llama3": true
+  },
+  "results": [
+    {
+      "tokenizer_name": "tiktoken/llama3",
+      "model_name": "llama3",
+      "input_size_bytes": 4194320,
+      "input_size_mb": 4.0000152587890625,
+      "token_count": 672020,
+      "mean_time_ms": 334.70068760216236,
+      "std_time_ms": 2.192534684630276,
+      "min_time_ms": 329.94320895522833,
+      "max_time_ms": 336.97608299553394,
+      "throughput_mb_s": 12.531554775248996,
+      "throughput_tokens_s": 2007823.7807470174,
+      "iterations": 10
+    },
+    {
+      "tokenizer_name": "huggingface/serial",
+      "model_name": "meta-llama/Meta-Llama-3.1-8B",
+      "input_size_bytes": 4194320,
+      "input_size_mb": 4.0000152587890625,
+      "token_count": 672020,
+      "mean_time_ms": 1468.923545931466,
+      "std_time_ms": 31.061982739807945,
+      "min_time_ms": 1427.829457912594,
+      "max_time_ms": 1522.0931249205023,
+      "throughput_mb_s": 2.855369846590838,
+      "throughput_tokens_s": 457491.47521075525,
+      "iterations": 10
+    },
+    {
+      "tokenizer_name": "huggingface/parallel",
+      "model_name": "meta-llama/Meta-Llama-3.1-8B",
+      "input_size_bytes": 4194320,
+      "input_size_mb": 4.0000152587890625,
+      "token_count": 672020,
+      "mean_time_ms": 575.0340582570061,
+      "std_time_ms": 27.103505483165264,
+      "min_time_ms": 535.3620410896838,
+      "max_time_ms": 619.1107498016208,
+      "throughput_mb_s": 7.294037526600533,
+      "throughput_tokens_s": 1168661.2129322728,
+      "iterations": 10
+    },
+    {
+      "tokenizer_name": "huggingface/streaming",
+      "model_name": "meta-llama/Meta-Llama-3.1-8B",
+      "input_size_bytes": 4194320,
+      "input_size_mb": 4.0000152587890625,
+      "token_count": 672020,
+      "mean_time_ms": 549.8272414086387,
+      "std_time_ms": 23.661777878375933,
+      "min_time_ms": 507.87462503649294,
+      "max_time_ms": 595.6940830219537,
+      "throughput_mb_s": 7.628432504097641,
+      "throughput_tokens_s": 1222238.4585352803,
+      "iterations": 10
+    }
+  ]
+}
